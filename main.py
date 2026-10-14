@@ -1,9 +1,66 @@
 import asyncio
 import importlib
 import sys
+from pathlib import Path
 
 import ccxt.pro as ccxt
 import config_parametros as cfg
+
+_RAIZ = Path(__file__).resolve().parent
+LOG_FILE = _RAIZ / "bot_hft.log"
+
+
+class _TeeLogger:
+    """Duplica toda salida de consola (stdout/stderr) hacia bot_hft.log en UTF-8 con flush inmediato."""
+    __slots__ = ("_stream", "_archivo")
+
+    def __init__(self, stream, archivo):
+        self._stream = stream
+        self._archivo = archivo
+
+    def write(self, data: str) -> int:
+        if not data:
+            return 0
+        try:
+            self._stream.write(data)
+            self._stream.flush()
+        except Exception:
+            pass
+        try:
+            self._archivo.write(data)
+            self._archivo.flush()
+        except Exception:
+            pass
+        return len(data)
+
+    def flush(self) -> None:
+        try:
+            self._stream.flush()
+        except Exception:
+            pass
+        try:
+            self._archivo.flush()
+        except Exception:
+            pass
+
+    def isatty(self) -> bool:
+        return getattr(self._stream, "isatty", lambda: False)()
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+# Consola a prueba de emojis (Windows usa cp1252 al redirigir la salida a log/pipe)
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+# Apertura persistente de bot_hft.log en modo append ('a') con vaciado por línea
+_log_handle = LOG_FILE.open("a", encoding="utf-8", buffering=1, errors="replace")
+sys.stdout = _TeeLogger(sys.stdout, _log_handle)
+sys.stderr = _TeeLogger(sys.stderr, _log_handle)
 
 radar = importlib.import_module("1_radar_volatilidad")
 vigilar_mercado = radar.cazar_anomalia_ws
@@ -11,13 +68,6 @@ sniper = importlib.import_module("3_ejecutor_sniper")
 enviar_alerta = importlib.import_module("4_telemetria_telegram").enviar_alerta
 gestor_mod = importlib.import_module("5_gestor_posiciones")
 stats = importlib.import_module("6_stats_tracker")
-
-# Consola a prueba de emojis (Windows usa cp1252 al redirigir la salida a log/pipe)
-for _stream in (sys.stdout, sys.stderr):
-    try:
-        _stream.reconfigure(encoding="utf-8", errors="replace")
-    except Exception:
-        pass
 
 REINTENTOS_ARRANQUE = 4
 TIMEOUT_EXCHANGE_MS = 20000
@@ -62,6 +112,7 @@ async def main():
     print("==================================================")
     print("INICIANDO CEREBRO CENTRAL SPLIT-BRAIN HFT (V6.1 - ADAPTIVE QUANTUM PREDATOR)")
     print("==================================================")
+    print(f"[MAIN] Telemetría local persistente activa en: {LOG_FILE.name}")
 
     exchange = ccxt.bybit({
         "apiKey": cfg.BYBIT_API_KEY,
@@ -123,3 +174,9 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("[MAIN] Apagado manual completado de forma segura.")
+    finally:
+        try:
+            _log_handle.flush()
+            _log_handle.close()
+        except Exception:
+            pass
