@@ -1,65 +1,153 @@
 import asyncio
 import importlib
+import re
 import time
+from decimal import ROUND_FLOOR, Decimal
+from typing import Optional
+
 import config_parametros as cfg
 
 # El nombre del módulo empieza por dígito: no admite `from 4_... import`.
 enviar_alerta = importlib.import_module("4_telemetria_telegram").enviar_alerta
+_gestor_mod = importlib.import_module("5_gestor_posiciones")
 
-MIN_INVERSION_USDT = 2.0
+MIN_INVERSION_USDT = 2.0  # margen mínimo por disparo
 
 # Motor de salidas Avellaneda-Stoikov (V6.0)
 ESPERA_LLENADO_SEG = 30   # máx. espera a que la compra maker se llene
 INTERVALO_AS_SEG = 2      # evaluar la física del mercado cada 2 segundos
 _tareas_as = set()        # referencias fuertes: asyncio solo guarda referencias débiles a las tareas
 
+# V6.1
+_en_vuelo: set[str] = set()              # pares con compra enviada y salida aún no entregada al gestor / AS
+_apalancamiento_ok: set[str] = set()     # pares con set_leverage ya aplicado
+_RE_BLACKLIST = re.compile(r"(?<!\d)(" + "|".join(cfg.CODIGOS_BLACKLIST) + r")(?!\d)")
 
-async def ejecutar_orden_sniper(exchange, symbol, z_score):
+
+def posicion_activa(symbol: str) -> bool:
+    """True si el par tiene una compra en curso o una posición gestionada (trailing o AS)."""
+    return symbol in _en_vuelo or _gestor_mod.gestor.tiene(symbol)
+
+
+def _d(x) -> Decimal:
+    return Decimal(str(x))
+
+
+def cuantizar_orden(exchange, symbol: str, nocional: float, precio: float) -> Optional[tuple[str, str]]:
+    """Smart quantization: cantidad = floor(nocional / precio) al step_size; precio con floor al tick_size.
+    Devuelve (amount, price) formateados, o None si no alcanza min_qty / min_notional (sin llamar a la API)."""
+    m = exchange.market(symbol)
+    step = _d(m["precision"]["amount"])
+    tick = _d(m["precision"]["price"])
+    min_qty = _d(m["limits"]["amount"]["min"] or 0)
+    min_notional = _d(m["limits"]["cost"]["min"] or 0)
+
+    precio_q = (_d(precio) / tick).to_integral_value(rounding=ROUND_FLOOR) * tick
+    if precio_q <= 0:
+        print(f"[FRANCOTIRADOR] Precio inválido en {symbol}: {precio}")
+        return None
+    cantidad = (_d(nocional) / precio_q / step).to_integral_value(rounding=ROUND_FLOOR) * step
+    valor = cantidad * precio_q
+    if cantidad <= 0 or cantidad < min_qty or valor < min_notional:
+        print(f"[FRANCOTIRADOR] Munición insuficiente en {symbol}: {cantidad.normalize():f} x {precio_q.normalize():f} "
+              f"= {valor:.4f} USDT (mín. {min_notional.normalize():f} USDT, mín. qty {min_qty.normalize():f}). Disparo abortado.")
+        return None
+    return exchange.amount_to_precision(symbol, float(cantidad)), exchange.price_to_precision(symbol, float(precio_q))
+
+
+def _es_error_blacklist(e: Exception) -> bool:
+    """Errores de permiso por símbolo (acuerdo sin firmar, compliance, whitelist). 10005 es de la API key: no cuenta."""
+    texto = str(e)
+    return bool(_RE_BLACKLIST.search(texto)) or "agreement" in texto.lower()
+
+
+async def _fijar_apalancamiento(exchange, symbol: str) -> None:
+    if symbol in _apalancamiento_ok:
+        return
+    try:
+        await exchange.set_leverage(cfg.APALANCAMIENTO, symbol)
+    except Exception as e:
+        if "110043" not in str(e):  # 110043 = "leverage not modified": ya estaba fijado
+            raise
+    _apalancamiento_ok.add(symbol)
+
+
+async def ejecutar_orden_sniper(exchange, symbol, z_score, ofi=None):
     if cfg.MODO_PAPER:
         print("[PAPER TRADING] Ejecución simulada")
+        return
+    if symbol in cfg.BLACKLIST_PAIRS or posicion_activa(symbol):
+        print(f"[FRANCOTIRADOR] {symbol} no disparable (lista negra o posición activa).")
         return
 
     try:
         await exchange.load_markets()  # cacheado tras la 1ª llamada; necesario para *_to_precision
 
-        # 1. Saldo libre y tamaño Kelly
+        # 1. Saldo libre y tamaño Kelly: margen = libre × Kelly; nocional = margen × apalancamiento
         balance = await exchange.fetch_balance()
         libre = float(balance.get("USDT", {}).get("free") or 0)
         inversion = libre * cfg.KELLY_MAX_PCT
-        minimo_mercado = exchange.market(symbol)["limits"]["cost"]["min"] or 0
-        if inversion < max(MIN_INVERSION_USDT, minimo_mercado):
-            raise ValueError(f"Inversión {inversion:.2f} USDT bajo el mínimo operable")
+        if inversion < MIN_INVERSION_USDT:
+            print(f"[FRANCOTIRADOR] Munición insuficiente: margen {inversion:.2f} USDT < {MIN_INVERSION_USDT} USDT. Disparo abortado.")
+            return
+        nocional = inversion * cfg.APALANCAMIENTO
 
         # 2. Precio de disparo, siempre en lado maker (nunca cruzar el spread)
         ticker = await exchange.fetch_ticker(symbol)
         last, bid = ticker["last"], ticker["bid"]
         precio_ref = min(last, bid) if bid else last
 
-        # 3. Precisión según las reglas del exchange
-        price = exchange.price_to_precision(symbol, precio_ref)
-        amount = exchange.amount_to_precision(symbol, inversion / float(price))
+        # 3. Smart quantization (step/tick/min_notional). Si no alcanza, aborta sin tocar la API de órdenes.
+        cuantizado = cuantizar_orden(exchange, symbol, nocional, precio_ref)
+        if cuantizado is None:
+            return
+        amount, price = cuantizado
         precio_tp = exchange.price_to_precision(symbol, float(price) * (1 + cfg.TP_PCT))
-        precio_sl = exchange.price_to_precision(symbol, float(price) * (1 - cfg.SL_PCT))
+        precio_sl = exchange.price_to_precision(symbol, float(price) * (1 - cfg.SL_PCT))  # SL de catástrofe (-3 %)
 
         # 4-5. Limit Maker estricto con SL de emergencia adjunto.
         # V6.0: el take-profit ya no se delega al exchange (precio_tp queda solo como referencia);
-        # la salida la gestiona motor_salida_avellaneda_stoikov.
+        # la salida la gestiona el PositionManager (V6.1) o motor_salida_avellaneda_stoikov (V6.0).
+        await _fijar_apalancamiento(exchange, symbol)
         params = {"timeInForce": "PostOnly", "stopLoss": str(precio_sl)}
         orden = await exchange.create_order(symbol, "limit", "buy", amount, price, params)
     except Exception as e:
         # Sin emojis en consola: en Windows (cp1252) provocan UnicodeEncodeError dentro del except.
-        print(f"[SNIPER] ERROR ejecutando {symbol}: {type(e).__name__}: {e}")
+        print(f"[FRANCOTIRADOR] ERROR ejecutando {symbol}: {type(e).__name__}: {e}")
+        if _es_error_blacklist(e):
+            cfg.BLACKLIST_PAIRS.add(symbol)
+            print(f"[FRANCOTIRADOR] {symbol} a la lista negra dinámica (permiso/contrato). WebSocket liberado.")
         await enviar_alerta(f"🔴 ERROR Sniper {symbol}: {e}")  # silenciado por el filtro
         return
 
     await enviar_alerta(
         f"🟩 ALERTA VERDE (PROD):\nOrden Limit PostOnly en {symbol}\nPrecio: {price}\nID: {orden['id']}"
     )
+    print(f"[FRANCOTIRADOR] Orden {orden['id']} en {symbol}: {amount} @ {price} (nocional ~{float(amount) * float(price):.2f} USDT, "
+          f"{cfg.APALANCAMIENTO}x, Z={z_score:.2f}, OFI={ofi if ofi is None else round(ofi, 2)})")
 
-    # Motor AS en segundo plano: no bloquea al Sniper.
-    tarea = asyncio.create_task(motor_salida_avellaneda_stoikov(exchange, symbol, amount, price, orden["id"]))
+    # Salida en segundo plano: no bloquea al Sniper.
+    _en_vuelo.add(symbol)
+    if cfg.MOTOR_SALIDA == "AS":
+        tarea = asyncio.create_task(motor_salida_avellaneda_stoikov(exchange, symbol, amount, price, orden["id"]))
+    else:
+        tarea = asyncio.create_task(_entregar_al_gestor(exchange, symbol, orden["id"], price, z_score, ofi))
     _tareas_as.add(tarea)
     tarea.add_done_callback(_tareas_as.discard)
+    tarea.add_done_callback(lambda _t: _en_vuelo.discard(symbol))
+
+
+async def _entregar_al_gestor(exchange, symbol, id_compra, price, z_score, ofi):
+    """Espera el llenado real de la compra y entrega la posición al PositionManager (V6.1)."""
+    try:
+        llenado, medio = await _esperar_llenado_detalle(exchange, symbol, id_compra)
+        if llenado <= 0:
+            print(f"[FRANCOTIRADOR] Compra en {symbol} no llenada: sin posición que gestionar.")
+            return
+        _gestor_mod.gestor.abrir(exchange, symbol, llenado, medio or float(price), z_score, ofi)
+    except Exception as e:
+        print(f"[FRANCOTIRADOR] ERROR entregando {symbol} al gestor: {type(e).__name__}: {e} "
+              f"(la posición conserva el SL de Bybit)")
 
 
 async def _estado_orden(exchange, order_id, symbol):
@@ -81,8 +169,12 @@ async def _posicion_larga(exchange, symbol):
     return total
 
 
-async def _esperar_llenado_compra(exchange, symbol, id_compra):
-    """Devuelve la cantidad realmente comprada (0 si no se llenó). Cancela el resto al expirar."""
+async def _esperar_llenado_detalle(exchange, symbol, id_compra) -> tuple[float, Optional[float]]:
+    """(cantidad realmente comprada, precio medio). (0, None) si no se llenó. Cancela el resto al expirar."""
+    def _resultado(o):
+        medio = o.get("average") or o.get("price")
+        return float(o.get("filled") or 0), (float(medio) if medio else None)
+
     limite = time.time() + ESPERA_LLENADO_SEG
     while time.time() < limite:
         await asyncio.sleep(1)
@@ -91,16 +183,21 @@ async def _esperar_llenado_compra(exchange, symbol, id_compra):
         except Exception:
             continue
         if o.get("status") in ("closed", "canceled", "rejected", "expired"):  # p. ej. PostOnly rechazado
-            return float(o.get("filled") or 0)
+            return _resultado(o)
     try:
         await exchange.cancel_order(id_compra, symbol)
     except Exception:
         pass  # ya llenada o cancelada
     try:
-        return float((await _estado_orden(exchange, id_compra, symbol)).get("filled") or 0)
+        return _resultado(await _estado_orden(exchange, id_compra, symbol))
     except Exception as e:
         print(f"[{symbol}] AS: no se pudo confirmar el llenado de la compra: {type(e).__name__}: {e}")
-        return 0.0
+        return 0.0, None
+
+
+async def _esperar_llenado_compra(exchange, symbol, id_compra):
+    """Devuelve la cantidad realmente comprada (0 si no se llenó). Cancela el resto al expirar."""
+    return (await _esperar_llenado_detalle(exchange, symbol, id_compra))[0]
 
 
 async def motor_salida_avellaneda_stoikov(exchange, symbol, amount, entry_price, id_compra=None):

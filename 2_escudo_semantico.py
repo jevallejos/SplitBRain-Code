@@ -36,5 +36,5 @@ async def evaluar_anomalia_groq(symbol) -> bool:
         return datos.get("aprobado") is True
     except Exception as e:
         # 429 / 503 / Timeout / JSON inválido / sin API key → RECHAZADO
-        print(f"[ESCUDO LPU] Fallo evaluando {symbol}: {type(e).__name__}: {e}")
+        print(f"[ESCUDO (Groq)] Fallo evaluando {symbol}: {type(e).__name__}: {e}")
         return False
