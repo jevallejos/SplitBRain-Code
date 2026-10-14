@@ -1,5 +1,7 @@
+"""Cerebro Central SPLIT-BRAIN HFT (V6.2.1 - Hotfix Single-Instance Lock & Anti-Zombie)."""
 import asyncio
 import importlib
+import os
 import sys
 from pathlib import Path
 
@@ -8,10 +10,57 @@ import config_parametros as cfg
 
 _RAIZ = Path(__file__).resolve().parent
 LOG_FILE = _RAIZ / "bot_hft.log"
+LOCK_FILE = _RAIZ / ".splitbrain.lock"
+_lock_file_handle = None
+
+
+def adquirir_bloqueo_instancia_unica() -> None:
+    """Garantiza la ejecución de exactamente una instancia física de Split-Brain (Cross-Platform)."""
+    global _lock_file_handle
+    try:
+        _lock_file_handle = LOCK_FILE.open("a+", encoding="utf-8")
+        if sys.platform != "win32":
+            import fcntl
+            fcntl.flock(_lock_file_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        else:
+            import msvcrt
+            _lock_file_handle.seek(0)
+            msvcrt.locking(_lock_file_handle.fileno(), msvcrt.LK_NBLCK, 1)
+
+        _lock_file_handle.seek(0)
+        _lock_file_handle.truncate()
+        _lock_file_handle.write(f"{os.getpid()}\n")
+        _lock_file_handle.flush()
+    except (BlockingIOError, PermissionError, OSError):
+        print(f"❌ [CRÍTICO] Ya existe una instancia activa de SPLITBRAIN ejecutándose (PID Lock en {LOCK_FILE.name}).")
+        print("❌ [CRÍTICO] Abortando este proceso inmediatamente para evitar dobles disparos y colapso de margen.")
+        sys.exit(1)
+
+
+def liberar_bloqueo_instancia_unica() -> None:
+    """Libera el cerrojo y elimina el archivo de bloqueo al apagar el bot limpiamente."""
+    global _lock_file_handle
+    if _lock_file_handle:
+        try:
+            if sys.platform != "win32":
+                import fcntl
+                fcntl.flock(_lock_file_handle.fileno(), fcntl.LOCK_UN)
+            else:
+                import msvcrt
+                _lock_file_handle.seek(0)
+                msvcrt.locking(_lock_file_handle.fileno(), msvcrt.LK_UNLCK, 1)
+            _lock_file_handle.close()
+        except Exception:
+            pass
+    try:
+        if LOCK_FILE.exists():
+            LOCK_FILE.unlink()
+    except Exception:
+        pass
 
 
 class _TeeLogger:
-    """Duplica toda salida de consola (stdout/stderr) hacia bot_hft.log en UTF-8 con flush inmediato."""
+    """Duplica la salida estándar hacia bot_hft.log en UTF-8 con vaciado continuo."""
     __slots__ = ("_stream", "_archivo")
 
     def __init__(self, stream, archivo):
@@ -50,14 +99,13 @@ class _TeeLogger:
         return getattr(self._stream, name)
 
 
-# Consola a prueba de emojis (Windows usa cp1252 al redirigir la salida a log/pipe)
+# Sanitización de consola contra problemas de encoding en entornos heredados
 for _s in (sys.stdout, sys.stderr):
     try:
         _s.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
         pass
 
-# Apertura persistente de bot_hft.log en modo append ('a') con vaciado por línea
 _log_handle = LOG_FILE.open("a", encoding="utf-8", buffering=1, errors="replace")
 sys.stdout = _TeeLogger(sys.stdout, _log_handle)
 sys.stderr = _TeeLogger(sys.stderr, _log_handle)
@@ -76,7 +124,7 @@ RECV_WINDOW_MS = 15000
 
 
 def _es_perpetuo_cripto_puro(exchange, symbol: str) -> bool:
-    """Filtra perpetuos lineales USDT activos, excluyendo listas negras y sintéticos (stock/ETF/commodity/forex)."""
+    """Filtra perpetuos lineales USDT activos, excluyendo listas negras y sintéticos."""
     if not symbol.endswith("USDT:USDT"):
         return False
     if symbol in cfg.PROHIBIDAS or symbol in cfg.BLACKLIST_PAIRS:
@@ -86,14 +134,12 @@ def _es_perpetuo_cripto_puro(exchange, symbol: str) -> bool:
         return False
     info = m.get("info") or {}
     symbol_type = str(info.get("symbolType") or "").strip().lower()
-    # En Bybit v5, '' o 'innovation' son criptoactivos; 'stock', 'etf', 'commodity', 'forex' son sintéticos.
     if symbol_type and symbol_type not in ("", "innovation"):
         return False
     return True
 
 
 async def _inicializar_mercados_con_backoff(exchange) -> dict:
-    """Carga mercados y tickers con reintentos exponenciales contra DNS frío o InvalidNonce."""
     ultimo_error = None
     for intento in range(1, REINTENTOS_ARRANQUE + 1):
         try:
@@ -103,16 +149,20 @@ async def _inicializar_mercados_con_backoff(exchange) -> dict:
         except Exception as e:
             ultimo_error = e
             espera = min(2 ** intento, 10)
-            print(f"[MAIN] Aviso de red en arranque (intento {intento}/{REINTENTOS_ARRANQUE}): "
-                  f"{type(e).__name__}: {e}. Reintentando en {espera}s...")
+            print(
+                f"[MAIN] Aviso de red en arranque (intento {intento}/{REINTENTOS_ARRANQUE}): "
+                f"{type(e).__name__}: {e}. Reintentando en {espera}s..."
+            )
             await asyncio.sleep(espera)
     raise RuntimeError(f"Fallo crítico inicializando mercados tras {REINTENTOS_ARRANQUE} intentos: {ultimo_error}")
 
 
 async def main():
-    print("==================================================")
-    print("INICIANDO CEREBRO CENTRAL SPLIT-BRAIN HFT (V6.2 - GROQ RAM LOCK-FREE SENTINEL)")
-    print("==================================================")
+    adquirir_bloqueo_instancia_unica()
+    print("==================================================================")
+    print("INICIANDO CEREBRO CENTRAL SPLIT-BRAIN HFT (V6.2.1 - RESILIENCE HOTFIX)")
+    print("==================================================================")
+    print(f"[MAIN] Bloqueo de instancia física adquirido exitosamente (PID {os.getpid()}).")
     print(f"[MAIN] Telemetría local persistente activa en: {LOG_FILE.name}")
 
     exchange = ccxt.bybit({
@@ -127,7 +177,7 @@ async def main():
         },
     })
 
-    tareas: list[asyncio.Task] = []  # referencias fuertes: evita que el GC destruya tareas en curso
+    tareas: list[asyncio.Task] = []
     try:
         tickers = await _inicializar_mercados_con_backoff(exchange)
         candidatos = [
@@ -137,36 +187,33 @@ async def main():
         candidatos.sort(key=lambda t: float(t.get("quoteVolume") or 0.0), reverse=True)
         presas = [t["symbol"] for t in candidatos[:cfg.TOP_N]]
 
-        print(f"[MAIN] Modo Paper: {cfg.MODO_PAPER} | Motor Salida: {cfg.MOTOR_SALIDA} | Apalancamiento: {cfg.APALANCAMIENTO}x")
+        print(
+            f"[MAIN] Modo Paper: {cfg.MODO_PAPER} | Motor Salida: {cfg.MOTOR_SALIDA} | "
+            f"Máx Hold: {cfg.TIEMPO_MAX_HOLD_SEG}s | Apalancamiento: {cfg.APALANCAMIENTO}x"
+        )
         print(f"[MAIN] Radar fijado en {len(presas)} pares cripto-nativos.")
-        print(f"[MAIN] Presas: {', '.join(presas)}")
+        print(f"[MAIN] Presas activas: {', '.join(presas)}")
 
-        # Inicializar Whitelist O(1) en RAM con las presas activas
         escudo.centinela.inicializar_universo(presas)
-
-        # Mostrar estado inicial de la Caja Negra (histórico JSONL + balance en vivo)
         stats.tracker.imprimir_dashboard(await stats.leer_balance_real(exchange))
+        await enviar_alerta("🟩 Motor SPLITBRAIN V6.2.1 Hotfix Resiliencia Inicializado.")
 
-        # Notificar a Telegram SOLO después de que el exchange respondió y el radar está armado
-        await enviar_alerta("🟩 Motor SPLITBRAIN V6.2 Apex Predator (Groq RAM O(1)) Inicializado.")
-
-        # 1. Tarea de Circuit Breaker Global (BTC con recuperación en V)
+        # 1. Tarea de Circuit Breaker Global BTC
         tareas.append(asyncio.create_task(radar.cazar_cisne_negro(exchange)))
 
-        # 2. Tarea Demonio del Centinela Groq en Background (actualiza Whitelist en RAM cada 180s)
+        # 2. Tarea Demonio Centinela Groq RAM en Background
         tareas.append(asyncio.create_task(escudo.centinela.bucle_centinela_background(cfg.GROQ_CICLO_SEG)))
 
-        # 3. Tareas del Radar de Volatilidad y Microestructura OFI por cada presa
+        # 3. Tareas del Radar para cada par seleccionado
         for symbol in presas:
             tareas.append(asyncio.create_task(vigilar_mercado(exchange, symbol)))
 
-        # 4. Tarea periódica del Dashboard de Caja Negra
+        # 4. Tarea Periódica del Dashboard de la Caja Negra
         tareas.append(asyncio.create_task(stats.bucle_dashboard(exchange, cfg.DASHBOARD_INTERVALO_SEG)))
 
         while True:
             await asyncio.sleep(1)
     finally:
-        # Cancelación limpia de radares, centinela Groq, gestores de posición y motores de salida
         todas_las_tareas = list(tareas) + list(gestor_mod.gestor._tareas) + list(sniper._tareas_as)
         for t in todas_las_tareas:
             if not t.done():
@@ -174,6 +221,7 @@ async def main():
         if todas_las_tareas:
             await asyncio.gather(*todas_las_tareas, return_exceptions=True)
         await exchange.close()
+        liberar_bloqueo_instancia_unica()
 
 
 if __name__ == "__main__":
@@ -182,6 +230,7 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("[MAIN] Apagado manual completado de forma segura.")
     finally:
+        liberar_bloqueo_instancia_unica()
         try:
             _log_handle.flush()
             _log_handle.close()
