@@ -16,9 +16,9 @@ for _stream in (sys.stdout, sys.stderr):
 
 async def main():
     print("==================================================")
-    print("INICIANDO CEREBRO CENTRAL SPLIT-BRAIN HFT (V5.0 - ARQUITECTURA CUÁNTICA OFI)")
+    print("INICIANDO CEREBRO CENTRAL SPLIT-BRAIN HFT (V6.0 - ARQUITECTURA AVELLANEDA-STOIKOV)")
     print("==================================================")
-    await enviar_alerta("🟩 Motor SPLITBRAIN V5.0 Inicializado.")
+    await enviar_alerta("🟩 Motor SPLITBRAIN V6.0 Inicializado.")
 
     exchange = ccxt.bybit({"apiKey": cfg.BYBIT_API_KEY, "secret": cfg.BYBIT_API_SECRET})
     tareas = []  # referencias fuertes: evita que el GC destruya tareas en curso

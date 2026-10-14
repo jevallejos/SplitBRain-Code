@@ -7,6 +7,10 @@ PALABRAS_SILENCIADAS = ['🔴', 'ERROR', 'denegada', 'abortó', 'BLOQUEO', 'COLA
 
 
 async def enviar_alerta(mensaje: str):
+    # Lista blanca V6.0: solo los mensajes verdes llegan al operador.
+    if "🟩" not in str(mensaje):
+        return
+
     if any(p in str(mensaje) for p in PALABRAS_SILENCIADAS):
         return
 
