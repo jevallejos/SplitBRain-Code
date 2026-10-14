@@ -1,4 +1,4 @@
-"""Cerebro Central SPLIT-BRAIN HFT (V6.2.1 - Hotfix Single-Instance Lock & Anti-Zombie)."""
+"""Cerebro Central SPLIT-BRAIN HFT (V6.2.2 - Boot-Time Orphan Reconciliation & PID Lock)."""
 import asyncio
 import importlib
 import os
@@ -99,7 +99,6 @@ class _TeeLogger:
         return getattr(self._stream, name)
 
 
-# Sanitización de consola contra problemas de encoding en entornos heredados
 for _s in (sys.stdout, sys.stderr):
     try:
         _s.reconfigure(encoding="utf-8", errors="replace")
@@ -157,10 +156,30 @@ async def _inicializar_mercados_con_backoff(exchange) -> dict:
     raise RuntimeError(f"Fallo crítico inicializando mercados tras {REINTENTOS_ARRANQUE} intentos: {ultimo_error}")
 
 
+async def _auditar_margen_libre(exchange) -> None:
+    """Inspecciona el balance USDT libre vs bloqueado después de reconciliar posiciones."""
+    if cfg.MODO_PAPER:
+        return
+    try:
+        bal = await exchange.fetch_balance()
+        usdt = bal.get("USDT") or {}
+        total = float(usdt.get("total") or 0.0)
+        libre = float(usdt.get("free") or 0.0)
+        usado = max(0.0, total - libre)
+        margen_disparo = libre * cfg.KELLY_MAX_PCT
+        estado = "LISTO PARA DISPARAR" if margen_disparo >= 2.0 else "MUNICIÓN BAJA (< 2.0 USDT)"
+        print(
+            f"[MAIN] Auditoría UTA USDT -> Total: {total:.4f} | Libre: {libre:.4f} | "
+            f"Bloqueado: {usado:.4f} | Margen Kelly (35%): {margen_disparo:.2f} USDT [{estado}]"
+        )
+    except Exception as e:
+        print(f"[MAIN] Aviso leyendo margen libre: {type(e).__name__}: {e}")
+
+
 async def main():
     adquirir_bloqueo_instancia_unica()
     print("==================================================================")
-    print("INICIANDO CEREBRO CENTRAL SPLIT-BRAIN HFT (V6.2.1 - RESILIENCE HOTFIX)")
+    print("INICIANDO CEREBRO CENTRAL SPLIT-BRAIN HFT (V6.2.2 - ORPHAN RECONCILIATION)")
     print("==================================================================")
     print(f"[MAIN] Bloqueo de instancia física adquirido exitosamente (PID {os.getpid()}).")
     print(f"[MAIN] Telemetría local persistente activa en: {LOG_FILE.name}")
@@ -194,9 +213,13 @@ async def main():
         print(f"[MAIN] Radar fijado en {len(presas)} pares cripto-nativos.")
         print(f"[MAIN] Presas activas: {', '.join(presas)}")
 
+        # 0. Reconciliar y liquidar posiciones huérfanas de sesiones previas ANTES de armar el Sniper
+        await gestor_mod.gestor.reconciliar_posiciones_exchange(exchange)
+        await _auditar_margen_libre(exchange)
+
         escudo.centinela.inicializar_universo(presas)
         stats.tracker.imprimir_dashboard(await stats.leer_balance_real(exchange))
-        await enviar_alerta("🟩 Motor SPLITBRAIN V6.2.1 Hotfix Resiliencia Inicializado.")
+        await enviar_alerta("🟩 Motor SPLITBRAIN V6.2.2 (Auto-Reconciliación + Anti-Zombie) Inicializado.")
 
         # 1. Tarea de Circuit Breaker Global BTC
         tareas.append(asyncio.create_task(radar.cazar_cisne_negro(exchange)))

@@ -1,4 +1,4 @@
-"""PositionManager SPLITBRAIN V6.2.1: Gestión Dinámica, Anti-Zombie Escape y Resiliencia."""
+"""PositionManager SPLITBRAIN V6.2.2: Auto-Reconciliación de Huérfanas, Anti-Zombie y Resiliencia."""
 import asyncio
 import importlib
 import time
@@ -58,9 +58,11 @@ class PositionManager:
         entrada: float,
         z_entrada: Optional[float] = None,
         ofi_entrada: Optional[float] = None,
+        t_apertura_override: Optional[float] = None,
     ) -> Posicion:
         media_movil = importlib.import_module("1_radar_volatilidad").MediaMovilTemporal
         entrada = float(entrada)
+        t_inicio = float(t_apertura_override) if t_apertura_override is not None else time.time()
         pos = Posicion(
             symbol=symbol,
             cantidad=float(cantidad),
@@ -70,19 +72,97 @@ class PositionManager:
             sl=entrada * (1 - cfg.SL_INICIAL_PCT),
             sl_exchange=entrada * (1 - cfg.SL_PCT),
             max_precio=entrada,
-            t_apertura=time.time(),
+            t_apertura=t_inicio,
             ofi_media=media_movil(cfg.OFI_SALIDA_VENTANA_SEG),
         )
-        pos.t_ult_check = pos.t_apertura
+        pos.t_ult_check = time.time()
         self.posiciones[symbol] = pos
         tarea = asyncio.create_task(self._vigilar(exchange, pos))
         self._tareas.add(tarea)
         tarea.add_done_callback(self._tareas.discard)
+        edad_s = max(0.0, time.time() - t_inicio)
         print(
-            f"[FRANCOTIRADOR] 🎯 Posición abierta en {symbol}: {pos.cantidad} @ {entrada} | "
-            f"SL interno {pos.sl:.6g} | SL Bybit {pos.sl_exchange:.6g} | Máx Hold {cfg.TIEMPO_MAX_HOLD_SEG}s"
+            f"[FRANCOTIRADOR] 🎯 Posición activa en {symbol}: {pos.cantidad} @ {entrada} "
+            f"(edad {edad_s:.0f}s / máx {cfg.TIEMPO_MAX_HOLD_SEG}s) | "
+            f"SL interno {pos.sl:.6g} | SL Bybit {pos.sl_exchange:.6g}"
         )
         return pos
+
+    async def reconciliar_posiciones_exchange(self, exchange) -> int:
+        """Audita Bybit al arrancar: adopta posiciones vivas o liquida zombies que excedan TIEMPO_MAX_HOLD_SEG."""
+        if cfg.MODO_PAPER:
+            return 0
+        try:
+            posiciones_raw = await exchange.fetch_positions()
+        except Exception as e:
+            print(f"[RECONCILIADOR] Aviso: no se pudieron leer posiciones iniciales: {type(e).__name__}: {e}")
+            return 0
+
+        ahora = time.time()
+        reconciliadas = 0
+        media_movil = importlib.import_module("1_radar_volatilidad").MediaMovilTemporal
+
+        for p in posiciones_raw or []:
+            side = str(p.get("side") or "").lower()
+            contratos = float(p.get("contracts") or 0.0)
+            symbol = p.get("symbol")
+            if side != "long" or contratos <= 0 or not symbol:
+                continue
+            if symbol in self.posiciones:
+                continue
+
+            info = p.get("info") or {}
+            entrada = float(p.get("entryPrice") or info.get("avgPrice") or 0.0)
+            if entrada <= 0:
+                continue
+
+            # Extraer timestamp de última modificación de la posición en Bybit (ms -> s)
+            updated_ms = float(info.get("updatedTime") or info.get("createdTime") or p.get("timestamp") or 0.0)
+            t_apertura_real = (updated_ms / 1000.0) if updated_ms > 1e9 else (ahora - cfg.TIEMPO_MAX_HOLD_SEG - 1.0)
+            edad_seg = max(0.0, ahora - t_apertura_real)
+
+            precio_marca = float(p.get("markPrice") or info.get("markPrice") or entrada)
+            reconciliadas += 1
+
+            if edad_seg >= cfg.TIEMPO_MAX_HOLD_SEG:
+                print(
+                    f"🧹 [RECONCILIADOR] Posición zombie huérfana detectada en {symbol}: "
+                    f"{contratos} contratos @ {entrada} (edad {edad_seg / 60.0:.1f} min >= "
+                    f"{cfg.TIEMPO_MAX_HOLD_SEG}s). Liquidando a mercado para liberar margen..."
+                )
+                pos_temp = Posicion(
+                    symbol=symbol,
+                    cantidad=contratos,
+                    entrada=entrada,
+                    z_entrada=None,
+                    ofi_entrada=None,
+                    sl=entrada * (1 - cfg.SL_INICIAL_PCT),
+                    sl_exchange=entrada * (1 - cfg.SL_PCT),
+                    max_precio=max(entrada, precio_marca),
+                    t_apertura=t_apertura_real,
+                    ofi_media=media_movil(cfg.OFI_SALIDA_VENTANA_SEG),
+                )
+                await self.cerrar(exchange, pos_temp, "ESCAPE_HUERFANA_BOOT", precio_marca)
+            else:
+                print(
+                    f"🔄 [RECONCILIADOR] Adoptando posición viva heredada en {symbol}: "
+                    f"{contratos} contratos @ {entrada} (edad {edad_seg:.0f}s)."
+                )
+                self.abrir(
+                    exchange,
+                    symbol,
+                    contratos,
+                    entrada,
+                    z_entrada=None,
+                    ofi_entrada=None,
+                    t_apertura_override=t_apertura_real,
+                )
+
+        if reconciliadas == 0:
+            print("[RECONCILIADOR] Sin posiciones huérfanas abiertas en Bybit. Margen 100% despejado.")
+        else:
+            print(f"[RECONCILIADOR] Reconciliación de arranque completada: {reconciliadas} posición(es) procesadas.")
+        return reconciliadas
 
     # ------------------------------------------------------------------ Vigilancia
     async def _vigilar(self, exchange, pos: Posicion) -> None:
@@ -133,7 +213,7 @@ class PositionManager:
         # 3. Disparadores deterministas de salida
         motivo = None
 
-        # A) Regla Hotfix V6.2.1: Liquidación forzada anti-zombie por expiración de tiempo
+        # A) Liquidación forzada anti-zombie por expiración de tiempo
         if tiempo_hold >= cfg.TIEMPO_MAX_HOLD_SEG:
             motivo = "ESCAPE_TEMPORAL"
             print(
