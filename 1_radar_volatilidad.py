@@ -8,7 +8,8 @@ import ccxt.pro as ccxt  # noqa: F401  (el exchange se inyecta desde main)
 import config_parametros as cfg
 
 # Los módulos empiezan por dígito: no admiten `import` normal.
-evaluar_anomalia_groq = importlib.import_module("2_escudo_semantico").evaluar_anomalia_groq
+_escudo = importlib.import_module("2_escudo_semantico")
+evaluar_anomalia_groq = _escudo.evaluar_anomalia_groq
 _sniper = importlib.import_module("3_ejecutor_sniper")
 ejecutar_orden_sniper = _sniper.ejecutar_orden_sniper
 
@@ -22,7 +23,7 @@ bloqueo_btc_hasta = 0
 
 
 class VentanaZ:
-    """Z-Score rodante O(1): sumas acumuladas en vez de recorrer el deque."""
+    """Z-Score rodante O(1): sumas acumuladas con piso relativo anti-ruido en mercados planos."""
     __slots__ = ("buf", "n", "s", "s2", "cnt")
 
     def __init__(self, n=VENTANA):
@@ -32,6 +33,12 @@ class VentanaZ:
     def reset(self):
         self.buf.clear()
         self.s = self.s2 = 0.0
+
+    def cambio_relativo(self) -> float:
+        """Retorno relativo entre el inicio y el final de la ventana de 60 s."""
+        if len(self.buf) < 2 or self.buf[0] <= 0:
+            return 0.0
+        return (self.buf[-1] - self.buf[0]) / self.buf[0]
 
     def push(self, x):
         # Validar ANTES de mutar: un None/NaN dentro del deque envenenaría la ventana para siempre.
@@ -54,7 +61,9 @@ class VentanaZ:
         std = max(self.s2 / self.n - media * media, 0.0) ** 0.5
         if std <= abs(media) * 1e-9:  # precio plano: evita Z gigantes por ruido numérico
             return 0.0
-        std = max(std, cfg.STD_MIN)  # V6.1 anti-glitch: suelo absoluto de la desviación estándar
+        # V6.2: piso de volatilidad relativa (STD_REL_FLOOR) + piso absoluto (STD_MIN)
+        piso_rel = abs(media) * getattr(cfg, "STD_REL_FLOOR", 0.0)
+        std = max(std, piso_rel, cfg.STD_MIN)
         return (x - media) / std
 
 
@@ -82,7 +91,7 @@ class MediaMovilTemporal:
         return self.media()
 
     def media(self):
-        return self.suma / len(self.buf) if self.buf else None
+        return self.suma / len(self.buf) if len(self.buf) else None
 
     def cobertura(self):
         """Segundos cubiertos por los datos de la ventana."""
@@ -138,8 +147,9 @@ async def cazar_cisne_negro(exchange):
                     precio_pre, precio_min = max(ventana.buf), last
                     print("🔴 [CIRCUIT BREAKER GLOBAL] ¡BTC COLAPSÓ!")
                 bloqueo_btc_hasta = ahora + BLOQUEO_S
+        except asyncio.CancelledError:
+            raise
         except Exception:
-            pass
             await asyncio.sleep(1)
 
 
@@ -163,17 +173,27 @@ async def cazar_anomalia_ws(exchange, symbol):
                 continue
             ultimo_seg = seg
 
+            t_inicio_ns = time.perf_counter_ns()
             ofi = calcular_ofi(ticker)
+            precio_actual = ticker.get("last")
+            z_actual = ventana.push(precio_actual)
 
-            z_actual = ventana.push(ticker["last"])
             if es_glitch(z_actual):
                 print(f"[MICROESTRUCTURA] Glitch de datos ignorado en {symbol} (Z={z_actual})")
                 continue
-            if z_actual is None or z_actual > cfg.UMBRAL_PANICO:
+            if z_actual is None:
                 continue
 
-            # Árbol de decisión del gatillo
-            if time.time() < bloqueo_btc_hasta:
+            # V6.2: Alimentar telemetría en RAM para que el Centinela Groq la audite en background
+            _escudo.centinela.actualizar_telemetria(
+                symbol, z_actual, ofi, precio_actual, ventana.cambio_relativo()
+            )
+
+            if z_actual > cfg.UMBRAL_PANICO:
+                continue
+
+            # Árbol de decisión del gatillo en sub-milisegundos
+            if bloqueo_activo():
                 print(f"[BLOQUEO] Anomalía ignorada ({symbol})")
                 continue
             if ofi < cfg.UMBRAL_OFI_TOXICO:
@@ -182,17 +202,24 @@ async def cazar_anomalia_ws(exchange, symbol):
             if _sniper.posicion_activa(symbol):
                 continue  # ya hay una posición gestionándose en este par
 
-            print(f"[RADAR] {symbol} Z={z_actual:.2f} OFI={ofi:.2f} -> ESCUDO (Groq)")
-            if await evaluar_anomalia_groq(symbol):
-                # V6.1: re-validar el estado global en el instante del disparo (Groq tarda 0.4-1 s)
+            # V6.2: Verificación Lock-Free O(1) en memoria RAM (sin latencia HTTP de Groq en la ruta crítica)
+            aprobado_ram = await evaluar_anomalia_groq(symbol)
+            lat_us = (time.perf_counter_ns() - t_inicio_ns) / 1000.0
+            print(f"[RADAR] {symbol} Z={z_actual:.2f} OFI={ofi:.2f} -> ESCUDO RAM O(1): "
+                  f"{'APROBADO' if aprobado_ram else 'VETADO'} ({lat_us:.1f} µs)")
+
+            if aprobado_ram:
                 if bloqueo_activo():
-                    print(f"[BLOQUEO] Circuit breaker activado durante el escudo: disparo abortado ({symbol})")
+                    print(f"[BLOQUEO] Circuit breaker activado: disparo abortado ({symbol})")
                 elif _sniper.posicion_activa(symbol) or symbol in cfg.BLACKLIST_PAIRS:
                     print(f"[RADAR] {symbol} ya no es disparable: abortado.")
                 else:
                     await ejecutar_orden_sniper(exchange, symbol, z_actual, ofi)
+
             await asyncio.sleep(COOLDOWN_S)  # anti multi-disparo (también tras rechazo)
             ventana.reset()                   # exige 60 s de datos frescos
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             print(f"[RADAR] Error en {symbol}: {type(e).__name__}: {e}")
             await asyncio.sleep(1)

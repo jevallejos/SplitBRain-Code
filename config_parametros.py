@@ -66,3 +66,8 @@ DASHBOARD_INTERVALO_SEG = 300
 # Auto-blacklist dinámica (se rellena en tiempo de ejecución)
 BLACKLIST_PAIRS: set[str] = set()
 CODIGOS_BLACKLIST = ("110126", "10024", "10029")  # acuerdo sin firmar / compliance / símbolo no permitido
+
+# ===================== V6.2 GROQ RAM SENTINEL (LOCK-FREE) =====================
+GROQ_CICLO_SEG = 180          # Frecuencia de auditoría asíncrona en background (segundos)
+GROQ_TIMEOUT_SEG = 6.0        # Timeout HTTP para el demonio fuera de ruta crítica
+STD_REL_FLOOR = 0.0005        # Piso de volatilidad relativa (0.05 % del precio) contra micro-ruido en calma

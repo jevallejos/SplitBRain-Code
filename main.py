@@ -64,6 +64,7 @@ sys.stderr = _TeeLogger(sys.stderr, _log_handle)
 
 radar = importlib.import_module("1_radar_volatilidad")
 vigilar_mercado = radar.cazar_anomalia_ws
+escudo = importlib.import_module("2_escudo_semantico")
 sniper = importlib.import_module("3_ejecutor_sniper")
 enviar_alerta = importlib.import_module("4_telemetria_telegram").enviar_alerta
 gestor_mod = importlib.import_module("5_gestor_posiciones")
@@ -110,7 +111,7 @@ async def _inicializar_mercados_con_backoff(exchange) -> dict:
 
 async def main():
     print("==================================================")
-    print("INICIANDO CEREBRO CENTRAL SPLIT-BRAIN HFT (V6.1 - ADAPTIVE QUANTUM PREDATOR)")
+    print("INICIANDO CEREBRO CENTRAL SPLIT-BRAIN HFT (V6.2 - GROQ RAM LOCK-FREE SENTINEL)")
     print("==================================================")
     print(f"[MAIN] Telemetría local persistente activa en: {LOG_FILE.name}")
 
@@ -140,26 +141,32 @@ async def main():
         print(f"[MAIN] Radar fijado en {len(presas)} pares cripto-nativos.")
         print(f"[MAIN] Presas: {', '.join(presas)}")
 
+        # Inicializar Whitelist O(1) en RAM con las presas activas
+        escudo.centinela.inicializar_universo(presas)
+
         # Mostrar estado inicial de la Caja Negra (histórico JSONL + balance en vivo)
         stats.tracker.imprimir_dashboard(await stats.leer_balance_real(exchange))
 
         # Notificar a Telegram SOLO después de que el exchange respondió y el radar está armado
-        await enviar_alerta("🟩 Motor SPLITBRAIN V6.1 Apex Predator Inicializado.")
+        await enviar_alerta("🟩 Motor SPLITBRAIN V6.2 Apex Predator (Groq RAM O(1)) Inicializado.")
 
         # 1. Tarea de Circuit Breaker Global (BTC con recuperación en V)
         tareas.append(asyncio.create_task(radar.cazar_cisne_negro(exchange)))
 
-        # 2. Tareas del Radar de Volatilidad y Microestructura OFI por cada presa
+        # 2. Tarea Demonio del Centinela Groq en Background (actualiza Whitelist en RAM cada 180s)
+        tareas.append(asyncio.create_task(escudo.centinela.bucle_centinela_background(cfg.GROQ_CICLO_SEG)))
+
+        # 3. Tareas del Radar de Volatilidad y Microestructura OFI por cada presa
         for symbol in presas:
             tareas.append(asyncio.create_task(vigilar_mercado(exchange, symbol)))
 
-        # 3. Tarea periódica del Dashboard de Caja Negra (V6.1)
+        # 4. Tarea periódica del Dashboard de Caja Negra
         tareas.append(asyncio.create_task(stats.bucle_dashboard(exchange, cfg.DASHBOARD_INTERVALO_SEG)))
 
         while True:
             await asyncio.sleep(1)
     finally:
-        # Cancelación limpia de radares, gestores de posición y motores de salida
+        # Cancelación limpia de radares, centinela Groq, gestores de posición y motores de salida
         todas_las_tareas = list(tareas) + list(gestor_mod.gestor._tareas) + list(sniper._tareas_as)
         for t in todas_las_tareas:
             if not t.done():
