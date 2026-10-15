@@ -73,7 +73,7 @@ FEE_ROUNDTRIP_MAKER_TAKER: float = FEE_MAKER + FEE_TAKER  # 0.075%
 FEE_ROUNDTRIP_ESTIMADO: float = FEE_ROUNDTRIP_MAKER_TAKER
 
 # ==============================================================================
-# SECCIÓN 3: UNIVERSO DE ACTIVOS TIER-1 Y FILTROS DE EXCLUSIÓN
+# SECCIÓN 3: UNIVERSO DE ACTIVOS TIER-1, BLACKLIST Y CÓDIGOS DE RECHAZO BYBIT
 # ==============================================================================
 TOP_N_PARES: int = 15
 TOP_PARES_VOLUMEN: int = TOP_N_PARES
@@ -124,24 +124,41 @@ BLACKLIST_PAIRS = {
     "BNX/USDT:USDT",
 }
 
+# Códigos de error API Bybit V5 que vetan automáticamente un par (Requerido por 3_ejecutor_sniper.py línea 29)
+CODIGOS_BLACKLIST = (
+    "10001",
+    "110004",
+    "110007",
+    "110012",
+    "110043",
+    "110066",
+    "170131",
+    "170135",
+    "170136",
+    "30208",
+)
+BYBIT_CODIGOS_BLACKLIST = CODIGOS_BLACKLIST
+DURACION_BLACKLIST_DINAMICA_SEG: float = 3600.0
+BLACKLIST_TTL_SEG: float = DURACION_BLACKLIST_DINAMICA_SEG
+
 ZONAS_EXCLUIDAS = {"innovation", "pre-market", "premarket"}
 EXCLUIR_ZONA_INNOVATION: bool = True
 
 # ==============================================================================
-# SECCIÓN 4: ESCUDO SEMÁNTICO RAM O(1) Y POOL DE MODELOS GROQ LPU (ACTUALIZADO)
+# SECCIÓN 4: ESCUDO SEMÁNTICO RAM O(1) Y POOL DE MODELOS GROQ LPU (ORDEN ÓPTIMO TOKIO)
 # ==============================================================================
-# Ordenado por disponibilidad de permisos de proyecto y cuota en la cuenta Groq:
-# 1. openai/gpt-oss-20b  (30 RPM | 1K RPD | 8K TPM | 200K TPD) -> Primario ultrarrápido
-# 2. openai/gpt-oss-120b (30 RPM | 1K RPD | 8K TPM | 200K TPD) -> Failover directo #1 (misma familia OpenAI OSS habilitada)
-# 3. allam-2-7b          (30 RPM | 7K RPD | 6K TPM | 500K TPD) -> Failover masivo #2 (7,000 RPD)
-# 4. qwen/qwen3.8-27b    (30 RPM | 1K RPD | 8K TPM | 200K TPD) -> Failover #3 (si se habilita en Project Limits)
-GROQ_MODEL: str = "openai/gpt-oss-20b"
+# Ordenado por latencia empírica medida en sniper-tokio (diagnosticar_permisos_groq.py):
+# 1. qwen/qwen3.8-27b    -> 242.6 ms RTT | JSON_OBJECT nativo | 1,000 RPD | 8,000 TPM
+# 2. allam-2-7b          -> 471.1 ms RTT | JSON_OBJECT nativo | 7,000 RPD | 6,000 TPM (500K TPD)
+# 3. openai/gpt-oss-20b  -> 306.7 ms RTT | JSON_OBJECT nativo | 1,000 RPD | 8,000 TPM (200K TPD)
+# 4. openai/gpt-oss-120b -> ~750 ms RTT  | RAW_TEXT directo   | 1,000 RPD | 8,000 TPM (200K TPD)
+GROQ_MODEL: str = "qwen/qwen3.8-27b"
 GROQ_MODEL_PRIMARY: str = GROQ_MODEL
 GROQ_MODEL_POOL = (
+    "qwen/qwen3.8-27b",
+    "allam-2-7b",
     "openai/gpt-oss-20b",
     "openai/gpt-oss-120b",
-    "allam-2-7b",
-    "qwen/qwen3.8-27b",
 )
 GROQ_CICLO_SEG: float = 180.0
 GROQ_INTERVALO_SEG: float = GROQ_CICLO_SEG
@@ -206,9 +223,10 @@ PENNY_JUMP_OFI_UMBRAL: float = 0.25
 PENNY_JUMP_OFI_MIN: float = PENNY_JUMP_OFI_UMBRAL
 PENNY_JUMP_SPREAD_MIN_TICKS: int = 2
 
-TIMEOUT_ORDEN_LIMITE_SEG: float = 8.0
+TIMEOUT_ORDEN_LIMITE_SEG: float = 10.0
 TIEMPO_VIDA_ORDEN_SEG: float = TIMEOUT_ORDEN_LIMITE_SEG
 TIMEOUT_ORDEN_MAKER_SEG: float = TIMEOUT_ORDEN_LIMITE_SEG
+TIMEOUT_ENTRADA_SEG: float = TIMEOUT_ORDEN_LIMITE_SEG
 
 # ==============================================================================
 # SECCIÓN 7: GESTIÓN DE SALIDA V6.4.0 (MAKER-FIRST UNWIND & ANTI-ZOMBIE 3 ETAPAS)
@@ -232,7 +250,8 @@ TRAIL_DISTANCIA_PCT: float = 0.0028
 TRAILING_DISTANCIA_PCT: float = TRAIL_DISTANCIA_PCT
 
 MAKER_UNWIND_ACTIVACION_PCT: float = 0.0052
-MAKER_UNWIND_TIMEOUT_SEG: float = 14.0
+MAKER_UNWIND_TIMEOUT_SEG: float = 12.0
+MAKER_UNWIND_PERSISTENCIA_SEG: float = MAKER_UNWIND_TIMEOUT_SEG
 MAKER_UNWIND_MAX_INTENTOS: int = 2
 MAKER_UNWIND_OFI_ABORT: float = -0.18
 
@@ -264,8 +283,7 @@ SL_PORCENTAJE: float = STOP_LOSS_PCT
 TP_PORCENTAJE: float = TAKE_PROFIT_PCT
 BE_ACTIVACION: float = BREAK_EVEN_ACTIVACION_PCT
 BE_OFFSET: float = BREAK_EVEN_OFFSET_PCT
-
-# Constantes heredadas de contrato AST
+# Constantes sincronizadas de contrato AST
 TOP_N = 15
 UMBRAL_PANICO = -2.6
 UMBRAL_OFI_TOXICO = 0.08
@@ -312,4 +330,3 @@ OFI_REANUDACION_BTC = 0.3
 OFI_REANUDACION_VENTANA_SEG = 30
 RECUPERACION_MIN_PCT = 0.5
 GROQ_MODELOS = ('openai/gpt-oss-20b', 'llama-3.3-70b-versatile', 'llama-3.1-8b-instant')
-CODIGOS_BLACKLIST = ('110126', '10024', '10029')

@@ -1,9 +1,14 @@
 """Escudo Semántico y Cuantitativo en Background (O(1) RAM Lookup + Rotación Multi-Modelo Groq).
-Optimizado para el catálogo real de Groq del usuario:
-1. openai/gpt-oss-20b  (8K TPM / 200K TPD / 1K RPD)
-2. qwen/qwen3.8-27b    (8K TPM / 200K TPD / 1K RPD)
-3. openai/gpt-oss-120b (8K TPM / 200K TPD / 1K RPD)
-4. allam-2-7b          (6K TPM / 500K TPD / 7K RPD)
+Calibrado con telemetría empírica desde sniper-tokio:
+1. qwen/qwen3.8-27b    (242.6 ms RTT | JSON_OBJECT nativo | 1K RPD)
+2. allam-2-7b          (471.1 ms RTT | JSON_OBJECT nativo | 7K RPD / 500K TPD)
+3. openai/gpt-oss-20b  (306.7 ms RTT | JSON_OBJECT nativo | 1K RPD)
+4. openai/gpt-oss-120b (~750 ms RTT  | RAW_TEXT directo   | 1K RPD)
+
+Incluye:
+- Captura explícita de `TimeoutError` / `asyncio.TimeoutError` (cuyo `str(e)` es vacío en Python 3.12+).
+- Enfriamiento temporal de 15 min para modelos con cuota diaria TPD/RPD agotada (se reactivan a las 00:00 UTC).
+- Invocación directa sin `response_format` para modelos que operan en modo `RAW_TEXT_FALLBACK` (`gpt-oss-120b`).
 """
 import asyncio
 import json
@@ -17,11 +22,12 @@ import config_parametros as cfg
 cliente_groq = AsyncGroq(api_key=cfg.GROQ_API_KEY) if cfg.GROQ_API_KEY else None
 
 _RE_THINK = re.compile(r"<think>.*?</think>", flags=re.DOTALL | re.IGNORECASE)
+_MODELOS_RAW_TEXT_DIRECTO = {"openai/gpt-oss-120b"}
 
 
 def _extraer_json_robusto(contenido: str) -> dict:
-    """Extrae el diccionario JSON incluso si el modelo (ej. qwen/qwen3.8-27b o allam-2-7b)
-    incluye etiquetas de razonamiento <think>...</think> o bloques Markdown ```json ... ```.
+    """Extrae el diccionario JSON incluso si el modelo incluye etiquetas
+    de razonamiento <think>...</think> o bloques Markdown ```json ... ```.
     """
     if not contenido:
         return {}
@@ -53,6 +59,8 @@ class CentinelaSemanticoRAM:
         self.ultimo_update_ts: float = 0.0
         self.universo_base: List[str] = []
         self._modelo_idx: int = 0
+        self._modelos_bloqueados_proyecto: Set[str] = set()
+        self._modelos_cooldown_hasta: Dict[str, float] = {}
 
     def inicializar_universo(self, presas: List[str]) -> None:
         """Habilita inicialmente las presas seleccionadas para no bloquear el arranque en frío."""
@@ -108,19 +116,39 @@ class CentinelaSemanticoRAM:
         return aprobados if aprobados else set(self.universo_base)
 
     def _lista_modelos(self) -> List[str]:
+        ahora = time.time()
         pool = list(cfg.GROQ_MODEL_POOL)
         if cfg.GROQ_MODEL and cfg.GROQ_MODEL not in pool:
             pool.insert(0, cfg.GROQ_MODEL)
-        return pool
+        disponibles = [
+            m
+            for m in pool
+            if m not in self._modelos_bloqueados_proyecto
+            and ahora >= self._modelos_cooldown_hasta.get(m, 0.0)
+        ]
+        return disponibles if disponibles else [m for m in pool if m not in self._modelos_bloqueados_proyecto] or pool
 
     async def _llamar_modelo_groq(self, modelo: str, prompt_sistema: str, resumen_json: str) -> str:
-        """Invoca a Groq intentando primero JSON mode nativo; si el modelo (ej. allam-2-7b o qwen3.8-27b)
-        no soporta `response_format`, reintenta en el acto en modo texto puro.
+        """Invoca a Groq en modo JSON_OBJECT para los modelos que lo soportan nativamente
+        (`qwen/qwen3.8-27b`, `allam-2-7b`, `openai/gpt-oss-20b`) y en modo directo sin `response_format`
+        para `openai/gpt-oss-120b`, ahorrando un viaje de red completo.
         """
         mensajes = [
             {"role": "system", "content": prompt_sistema},
             {"role": "user", "content": f"Telemetría actual: {resumen_json}"},
         ]
+        if modelo in _MODELOS_RAW_TEXT_DIRECTO:
+            respuesta = await asyncio.wait_for(
+                cliente_groq.chat.completions.create(
+                    messages=mensajes,
+                    model=modelo,
+                    temperature=0.0,
+                    max_tokens=320,
+                ),
+                timeout=cfg.GROQ_TIMEOUT_SEG,
+            )
+            return respuesta.choices[0].message.content or "{}"
+
         try:
             respuesta = await asyncio.wait_for(
                 cliente_groq.chat.completions.create(
@@ -135,7 +163,12 @@ class CentinelaSemanticoRAM:
             return respuesta.choices[0].message.content or "{}"
         except Exception as e_json:
             err_str = str(e_json).lower()
-            if "response_format" in err_str or "json_validate_failed" in err_str or "400" in err_str:
+            if (
+                "response_format" in err_str
+                or "json_validate_failed" in err_str
+                or ("400" in err_str and "permission" not in err_str and "blocked" not in err_str)
+            ):
+                _MODELOS_RAW_TEXT_DIRECTO.add(modelo)
                 respuesta = await asyncio.wait_for(
                     cliente_groq.chat.completions.create(
                         messages=mensajes,
@@ -149,7 +182,7 @@ class CentinelaSemanticoRAM:
             raise
 
     async def auditar_universo_una_vez(self) -> Set[str]:
-        """Ejecuta una auditoría de lotes en background rotando modelos ante 429/404/503."""
+        """Ejecuta una auditoría de lotes en background rotando modelos ante Timeout/429/403/404/503."""
         if not self.universo_base:
             return self.whitelist_activa
 
@@ -204,15 +237,30 @@ class CentinelaSemanticoRAM:
                 )
                 return self.whitelist_activa
             except Exception as e:
-                texto_err = str(e)
-                texto_low = texto_err.lower()
-                if any(k in texto_low for k in ("429", "rate_limit", "404", "not_found", "decommissioned", "503")):
+                nombre_exc = type(e).__name__.lower()
+                texto_low = str(e).lower()
+                es_timeout = isinstance(e, (TimeoutError, asyncio.TimeoutError)) or "timeout" in nombre_exc or "timeout" in texto_low
+
+                if any(k in texto_low for k in ("403", "permission", "blocked", "404", "not_found", "decommissioned")):
+                    self._modelos_bloqueados_proyecto.add(modelo_actual)
                     sig_idx = (idx + 1) % total_modelos
                     print(
-                        f"[ESCUDO RAM] Cuota/No-Disponible en `{modelo_actual}`. "
+                        f"[ESCUDO RAM] Modelo `{modelo_actual}` bloqueado/no-disponible (403/404). "
+                        f"Rotando a `{modelos[sig_idx]}`..."
+                    )
+                    continue
+
+                if es_timeout or any(k in texto_low for k in ("429", "rate_limit", "503", "overloaded")):
+                    if "tokens per day" in texto_low or "tpd" in texto_low or "requests per day" in texto_low:
+                        self._modelos_cooldown_hasta[modelo_actual] = time.time() + 900.0
+                    sig_idx = (idx + 1) % total_modelos
+                    motivo = "Timeout >6s" if es_timeout else "Cuota 429/503"
+                    print(
+                        f"[ESCUDO RAM] {motivo} en `{modelo_actual}`. "
                         f"Rotando automáticamente al modelo `{modelos[sig_idx]}`..."
                     )
                     continue
+
                 print(
                     f"[ESCUDO RAM] Aviso Groq background ({type(e).__name__}: {e}). "
                     f"Whitelist mantenida por heurística cuantitativa ({len(self.whitelist_activa)} activos)."
