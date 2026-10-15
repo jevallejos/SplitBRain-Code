@@ -1,6 +1,6 @@
 """Configuración Maestra Institucional — SplitBRain-Code V6.4.0 (Zero-Zombie & Maker-First Unwind).
 Arquitectura de Microestructura HFT en Bybit Perpetuos USDT (UTA).
-Cumple el 100% del contrato sintáctico AST de los 8 módulos y test_v6_2_suite.py.
+Cumple el 100% del contrato sintáctico AST (64 constantes) de los 8 módulos y test_v6_2_suite.py.
 """
 import os
 from dotenv import load_dotenv
@@ -33,7 +33,6 @@ ARCHIVO_LOG: str = LOG_FILE
 STATS_FILE: str = "splitbrain_stats_v6.jsonl"
 ARCHIVO_STATS: str = STATS_FILE
 
-# Intervalos de Caja Negra y Telemetría (Requerido por 6_stats_tracker.py línea 226)
 DASHBOARD_INTERVALO_SEG: float = 300.0
 INTERVALO_DASHBOARD_SEG: float = DASHBOARD_INTERVALO_SEG
 HEARTBEAT_INTERVALO_SEG: float = 60.0
@@ -131,18 +130,18 @@ EXCLUIR_ZONA_INNOVATION: bool = True
 # ==============================================================================
 # SECCIÓN 4: ESCUDO SEMÁNTICO RAM O(1) Y POOL DE MODELOS GROQ LPU (ACTUALIZADO)
 # ==============================================================================
-# Catálogo verificado en la cuenta Groq del usuario:
+# Ordenado por disponibilidad de permisos de proyecto y cuota en la cuenta Groq:
 # 1. openai/gpt-oss-20b  (30 RPM | 1K RPD | 8K TPM | 200K TPD) -> Primario ultrarrápido
-# 2. qwen/qwen3.8-27b    (30 RPM | 1K RPD | 8K TPM | 200K TPD) -> Failover cuantitativo #1
-# 3. openai/gpt-oss-120b (30 RPM | 1K RPD | 8K TPM | 200K TPD) -> Failover pesado #2
-# 4. allam-2-7b          (30 RPM | 7K RPD | 6K TPM | 500K TPD) -> Reserva masiva #3
+# 2. openai/gpt-oss-120b (30 RPM | 1K RPD | 8K TPM | 200K TPD) -> Failover directo #1 (misma familia OpenAI OSS habilitada)
+# 3. allam-2-7b          (30 RPM | 7K RPD | 6K TPM | 500K TPD) -> Failover masivo #2 (7,000 RPD)
+# 4. qwen/qwen3.8-27b    (30 RPM | 1K RPD | 8K TPM | 200K TPD) -> Failover #3 (si se habilita en Project Limits)
 GROQ_MODEL: str = "openai/gpt-oss-20b"
 GROQ_MODEL_PRIMARY: str = GROQ_MODEL
 GROQ_MODEL_POOL = (
     "openai/gpt-oss-20b",
-    "qwen/qwen3.8-27b",
     "openai/gpt-oss-120b",
     "allam-2-7b",
+    "qwen/qwen3.8-27b",
 )
 GROQ_CICLO_SEG: float = 180.0
 GROQ_INTERVALO_SEG: float = GROQ_CICLO_SEG
@@ -257,6 +256,15 @@ RECONCILIACION_MAX_EDAD_SEG: int = TIEMPO_MAX_HOLD_SEG
 INTERVALO_MONITOREO_POS_SEG: float = 0.5
 WS_POSITIONS_STREAM_ACTIVO: bool = True
 RECONCILIACION_BOOT_ACTIVA: bool = True
+
+# Constantes adicionales de compatibilidad AST con los 8 módulos
+UMBRAL_SIGMA_DINAMICO: float = PISO_SIGMA_RELATIVO
+CAIDA_MIN_VENTANA_PCT: float = RETORNO_MINIMO_CAIDA_PCT
+SL_PORCENTAJE: float = STOP_LOSS_PCT
+TP_PORCENTAJE: float = TAKE_PROFIT_PCT
+BE_ACTIVACION: float = BREAK_EVEN_ACTIVACION_PCT
+BE_OFFSET: float = BREAK_EVEN_OFFSET_PCT
+
 # Constantes heredadas de contrato AST
 TOP_N = 15
 UMBRAL_PANICO = -2.6
