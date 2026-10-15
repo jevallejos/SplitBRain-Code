@@ -1,11 +1,12 @@
-"""Suite de Verificación Integrada para SplitBRain-Code V6.2.2 (6/6 Pruebas de Grado Producción)."""
+"""Suite de Verificación Integrada para SplitBRain-Code V6.2.3 (7/7 Pruebas con Auditoría AST)."""
+import ast
 import asyncio
 import importlib
 import py_compile
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Set, Tuple
 
 ARCHIVOS_PROYECTO = [
     "config_parametros.py",
@@ -17,6 +18,18 @@ ARCHIVOS_PROYECTO = [
     "6_stats_tracker.py",
     "main.py",
 ]
+
+
+def _extraer_atributos_cfg_ast(raiz: Path) -> Set[Tuple[str, str]]:
+    """Escanea el AST de todos los módulos y extrae cada acceso `cfg.<ATRIBUTO>`."""
+    requeridos: Set[Tuple[str, str]] = set()
+    for nombre_archivo in ARCHIVOS_PROYECTO:
+        codigo = (raiz / nombre_archivo).read_text(encoding="utf-8")
+        arbol = ast.parse(codigo, filename=nombre_archivo)
+        for nodo in ast.walk(arbol):
+            if isinstance(nodo, ast.Attribute) and isinstance(nodo.value, ast.Name) and nodo.value.id == "cfg":
+                requeridos.add((nombre_archivo, nodo.attr))
+    return requeridos
 
 
 class _MockExchangeHuerfanas:
@@ -94,7 +107,7 @@ class _MockExchangeHuerfanas:
 
 async def ejecutar_auditoria_v6_2() -> None:
     print("==================================================================")
-    print("🧪 INICIANDO SUITE DE PRUEBAS INTEGRADA: SPLITBRAIN-CODE V6.2.2")
+    print("🧪 INICIANDO SUITE DE PRUEBAS INTEGRADA: SPLITBRAIN-CODE V6.2.3")
     print("==================================================================")
 
     # 1. Verificación de compilación sintáctica de todos los módulos del repositorio
@@ -103,7 +116,7 @@ async def ejecutar_auditoria_v6_2() -> None:
         ruta = raiz / archivo
         assert ruta.exists(), f"Falta el archivo obligatorio: {archivo}"
         py_compile.compile(str(ruta), doraise=True)
-    print(f"✅ [1/6] Compilación exitosa de los {len(ARCHIVOS_PROYECTO)} módulos del repositorio.")
+    print(f"✅ [1/7] Compilación exitosa de los {len(ARCHIVOS_PROYECTO)} módulos del repositorio.")
 
     cfg = importlib.import_module("config_parametros")
     radar = importlib.import_module("1_radar_volatilidad")
@@ -112,7 +125,17 @@ async def ejecutar_auditoria_v6_2() -> None:
     stats_mod = importlib.import_module("6_stats_tracker")
     main_mod = importlib.import_module("main")
 
-    # 2. Prueba de Latencia Lock-Free O(1) en RAM del Centinela Groq
+    # 2. Auditoría AST de Contratos de Configuración (Previene AttributeError en tiempo de ejecución)
+    referencias_cfg = _extraer_atributos_cfg_ast(raiz)
+    faltantes = [(arch, attr) for arch, attr in sorted(referencias_cfg) if not hasattr(cfg, attr)]
+    assert not faltantes, f"Atributos faltantes en config_parametros.py: {faltantes}"
+    atributos_unicos = {attr for _, attr in referencias_cfg}
+    print(
+        f"✅ [2/7] Contrato AST de config_parametros validado: {len(atributos_unicos)} constantes "
+        f"verificadas en {len(referencias_cfg)} puntos de llamada (incl. TP_PCT={cfg.TP_PCT})."
+    )
+
+    # 3. Prueba de Latencia Lock-Free O(1) en RAM del Centinela Groq
     presas_mock = ["SOL/USDT:USDT", "NEAR/USDT:USDT", "ADA/USDT:USDT", "ZEC/USDT:USDT"]
     escudo.centinela.inicializar_universo(presas_mock)
 
@@ -123,18 +146,18 @@ async def ejecutar_auditoria_v6_2() -> None:
     latencia_media_us = ((time.perf_counter_ns() - t0) / iteraciones) / 1000.0
     assert aprobado is True, "SOL/USDT:USDT debía estar aprobado en RAM"
     assert latencia_media_us < 50.0, f"Latencia excesiva en CPU: {latencia_media_us:.2f} µs"
-    print(f"✅ [2/6] Lookup O(1) en Whitelist RAM validado: {latencia_media_us:.3f} µs por consulta.")
+    print(f"✅ [3/7] Lookup O(1) en Whitelist RAM validado: {latencia_media_us:.3f} µs por consulta.")
 
-    # 3. Prueba de Fallback Cuantitativo ante Drenaje Estructural (Anti-LUNA)
+    # 4. Prueba de Fallback Cuantitativo ante Drenaje Estructural (Anti-LUNA)
     escudo.centinela.actualizar_telemetria(
         "NEAR/USDT:USDT", z_score=-5.4, ofi=-0.92, precio=4.50, cambio_pct=-0.085
     )
     aprobados_fallback = escudo.centinela._filtro_heuristico_respaldo()
     assert "NEAR/USDT:USDT" not in aprobados_fallback, "El fallback debió vetar el drenaje estructural de NEAR"
     assert "SOL/USDT:USDT" in aprobados_fallback, "SOL debía permanecer aprobado"
-    print("✅ [3/6] Filtro anti-colapso estructural (Anti-LUNA) validado correctamente.")
+    print("✅ [4/7] Filtro anti-colapso estructural (Anti-LUNA) validado correctamente.")
 
-    # 4. Prueba de Inmunidad contra Micro-Ruido en Mercado Plano (Bug BTC -0.04% / NEAR -0.16%)
+    # 5. Prueba de Inmunidad contra Micro-Ruido en Mercado Plano (Bug BTC -0.04% / NEAR -0.16%)
     vz = radar.VentanaZ(n=60)
     for _ in range(59):
         vz.push(83493.5)
@@ -151,15 +174,14 @@ async def ejecutar_auditoria_v6_2() -> None:
         f"Un colapso real de -2.2% debe activar el gatillo (Z obtenido: {z_panico_real:.2f})"
     )
     print(
-        f"✅ [4/6] Calibración VentanaZ verificada: Micro-ruido (-0.04%) -> Z={z_micro_ruido:.2f} (Ignorado) | "
+        f"✅ [5/7] Calibración VentanaZ verificada: Micro-ruido (-0.04%) -> Z={z_micro_ruido:.2f} (Ignorado) | "
         f"Colapso Real (-2.2%) -> Z={z_panico_real:.2f} (Disparo)."
     )
 
-    # 5. Prueba de Cerrojo Físico de Instancia Única (PID Lock en main.py)
+    # 6. Prueba de Cerrojo Físico de Instancia Única (PID Lock en main.py)
     if hasattr(main_mod, "adquirir_bloqueo_instancia_unica"):
         main_mod.adquirir_bloqueo_instancia_unica()
         assert main_mod.LOCK_FILE.exists(), "El archivo .splitbrain.lock no fue creado"
-        # Verificar que un segundo descriptor en el mismo nodo detecte el bloqueo activo
         segundo_handle = main_mod.LOCK_FILE.open("a+", encoding="utf-8")
         bloqueado_correctamente = False
         try:
@@ -176,17 +198,15 @@ async def ejecutar_auditoria_v6_2() -> None:
             segundo_handle.close()
             main_mod.liberar_bloqueo_instancia_unica()
         assert bloqueado_correctamente, "El cerrojo físico no bloqueó el segundo descriptor concurrente"
-        print("✅ [5/6] Cerrojo físico de instancia única (.splitbrain.lock) validado contra procesos duplicados.")
-    else:
-        print("⚠️ [5/6] main.py aún en versión V6.2 (sin adquirir_bloqueo_instancia_unica).")
+        print("✅ [6/7] Cerrojo físico de instancia única (.splitbrain.lock) validado contra procesos duplicados.")
 
-    # 6. Prueba de Auto-Reconciliación de Posiciones Huérfanas (ADA, ENA, XRP) sin tocar Caja Negra real
+    # 7. Prueba de Auto-Reconciliación de Posiciones Huérfanas (ADA, ENA, XRP) sin tocar Caja Negra real
     if hasattr(gestor_mod.gestor, "reconciliar_posiciones_exchange"):
         ruta_original = stats_mod.tracker.ruta
         trades_originales = stats_mod.tracker._trades
         modo_paper_original = cfg.MODO_PAPER
         alerta_original = gestor_mod.enviar_alerta
-        ruta_temp = raiz / ".test_stats_v6_2_2_tmp.jsonl"
+        ruta_temp = raiz / ".test_stats_v6_2_3_tmp.jsonl"
 
         async def _alerta_silenciosa(_msg: str) -> None:
             return None
@@ -197,7 +217,6 @@ async def ejecutar_auditoria_v6_2() -> None:
             stats_mod.tracker._trades = []
             gestor_mod.enviar_alerta = _alerta_silenciosa
 
-            # Simular que ADA, ENA y XRP llevan 4 horas abiertas (> TIEMPO_MAX_HOLD_SEG = 300s)
             t_hace_4_horas_ms = int((time.time() - 14_400) * 1000)
             mock_ex = _MockExchangeHuerfanas(t_antiguo_ms=t_hace_4_horas_ms)
             procesadas = await gestor_mod.gestor.reconciliar_posiciones_exchange(mock_ex)
@@ -208,7 +227,7 @@ async def ejecutar_auditoria_v6_2() -> None:
                 assert o["type"] == "market" and o["side"] == "sell", f"Orden inválida: {o}"
                 assert o["params"].get("reduceOnly") is True, "Falta reduceOnly=True en liquidación de huérfana"
             print(
-                "✅ [6/6] Auto-Reconciliación de arranque validada: 3 posiciones zombies (ADA, ENA, XRP) "
+                "✅ [7/7] Auto-Reconciliación de arranque validada: 3 posiciones zombies (ADA, ENA, XRP) "
                 "detectadas y liquidadas con reduceOnly=True."
             )
         finally:
@@ -218,11 +237,9 @@ async def ejecutar_auditoria_v6_2() -> None:
             gestor_mod.enviar_alerta = alerta_original
             if ruta_temp.exists():
                 ruta_temp.unlink()
-    else:
-        print("⚠️ [6/6] 5_gestor_posiciones.py aún en versión V6.2.1 (sin reconciliar_posiciones_exchange).")
 
     print("==================================================================")
-    print("🏆 TODAS LAS PRUEBAS DE INTEGRIDAD SUPERADAS SIN ERRORES")
+    print("🏆 TODAS LAS PRUEBAS DE INTEGRIDAD (7/7) SUPERADAS SIN ERRORES")
     print("==================================================================")
 
 

@@ -15,7 +15,7 @@ BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET")
 # ==============================================================================
 # 2. CONFIGURACIÓN BASE DE MERCADO Y RADAR DE MICROESTRUCTURA
 # ==============================================================================
-MODO_PAPER = False  # Modo Real UTA Perpetuos
+MODO_PAPER = False  # Modo Producción Real en Bybit UTA
 TOP_N = 15
 UMBRAL_PANICO = -2.6
 UMBRAL_OFI_TOXICO = -0.5
@@ -29,28 +29,29 @@ Z_MAX_ABS = 50.0
 KELLY_MAX_PCT = 0.35
 APALANCAMIENTO = 3
 CAPITAL_BASE_USDT = 13.18
-MIN_INVERSION_USDT = 2.0  # Margen mínimo para disparar
+MIN_INVERSION_USDT = 2.0  # Margen mínimo por disparo
 
 # ==============================================================================
-# 4. GESTIÓN DINÁMICA DE SALIDAS (HOTFIX V6.2.1 ANTI-ZOMBIE ESCAPE)
+# 4. GESTIÓN DINÁMICA DE SALIDAS (V6.2.3 ANTI-ZOMBIE + COMPATIBILIDAD SNIPER)
 # ==============================================================================
-MOTOR_SALIDA = "TRAILING"  # "TRAILING" (PositionManager V6.2.1) | "AS" (Avellaneda-Stoikov)
+MOTOR_SALIDA = "TRAILING"  # "TRAILING" (PositionManager) | "AS" (Avellaneda-Stoikov)
 
 # Horquilla temporal máxima para liberar margen forzosamente ante mercados planos
-TIEMPO_MAX_HOLD_SEG = 300  # 5 minutos máximos de retención (Erradicación de Posiciones Zombie)
+TIEMPO_MAX_HOLD_SEG = 300  # 5 minutos máximos de retención (Anti-Zombie)
 
-# Parámetros del PositionManager
-SL_PCT = 0.03                 # SL de emergencia en Bybit (-3.0%)
-SL_INICIAL_PCT = 0.025        # SL interno (-2.5%)
+# Parámetros de Take-Profit / Stop-Loss de referencia y emergencia
+TP_PCT = 0.05                 # Referencia de Take-Profit requerida por 3_ejecutor_sniper.py (+5.0%)
+SL_PCT = 0.03                 # SL de catástrofe adjunto en Bybit (-3.0%)
+SL_INICIAL_PCT = 0.025        # SL interno inicial (-2.5%)
 BE_ACTIVACION_PCT = 0.010     # PnL ≥ +1.0% → SL a break-even
 BE_OFFSET_PCT = 0.0015        # SL break-even = entrada + 0.15% (cubre fees)
 TRAIL_ACTIVACION_PCT = 0.015  # PnL ≥ +1.5% → Trailing activo
-TRAIL_DISTANCIA_PCT = 0.008   # Distancia de trailing: 0.8% desde el pico máximo
-OFI_SALIDA_EMERGENCIA = -0.80 # Salida inmediata a mercado si el flujo es tóxico en pérdidas
-OFI_SALIDA_VENTANA_SEG = 10   # Ventana de media móvil OFI
+TRAIL_DISTANCIA_PCT = 0.008   # Distancia de trailing: 0.8% desde el máximo
+OFI_SALIDA_EMERGENCIA = -0.80 # Salida a mercado si el flujo es tóxico en pérdidas
+OFI_SALIDA_VENTANA_SEG = 10   # Ventana de media móvil OFI para salida de emergencia
 SYNC_SL_EXCHANGE_SEG = 5      # Sincronización de SL dinámico hacia Bybit (segundos)
 
-# Parámetros heredados de Avellaneda-Stoikov (AS)
+# Parámetros Avellaneda-Stoikov (AS)
 GAMMA_AS = 0.05
 
 # ==============================================================================
