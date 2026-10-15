@@ -1,6 +1,7 @@
-"""PositionManager SPLITBRAIN V6.3.0:
+"""PositionManager SPLITBRAIN V6.3.1:
 Auto-Reconciliación de Huérfanas, Evacuación Macro Instantánea (BTC Crash / Contagio Cross-Asset),
-Cuarentena Post-Cierre Anti-Knife-Catching (300s), Micro-Break-Even (+0.48%) y Sync Zero-REST.
+Cuarentena Post-Cierre Anti-Knife-Catching (300s), Micro-Break-Even (+0.48% -> +0.16%) con Piso
+Invariante en Bybit (+0.10%) para inmunidad ante caídas de WebSocket.
 """
 import asyncio
 import importlib
@@ -15,7 +16,7 @@ _stats = importlib.import_module("6_stats_tracker")
 
 CHECK_POSICION_SEG = 10        # Verificación periódica de consistencia en Bybit
 REINTENTO_CIERRE_SEG = 2       # Backoff si falla la orden a mercado
-MARGEN_SL_EXCHANGE = 0.002     # SL de Bybit 0.2% por debajo del SL interno
+MARGEN_SL_EXCHANGE = 0.0004    # V6.3.1: Holgura reducida a 0.04% con piso estricto BE_PISO_EXCHANGE_PCT
 
 
 def calcular_ofi(ticker: dict) -> float:
@@ -58,7 +59,7 @@ class PositionManager:
         return symbol in self.posiciones
 
     def registrar_cooldown_post_cierre(self, symbol: str, duracion_seg: Optional[float] = None) -> None:
-        """V6.3.0 Grim Trigger Cooldown:
+        """V6.3.0+ Grim Trigger Cooldown:
         Bloquea nuevas entradas en `symbol` durante COOLDOWN_POST_CIERRE_SEG (300s)
         contados estrictamente desde el instante en que se cierra la posición.
         """
@@ -78,6 +79,18 @@ class PositionManager:
     def segundos_cooldown_restantes(self, symbol: str) -> float:
         expira = self.cooldown_hasta.get(symbol, 0.0)
         return max(0.0, expira - time.time())
+
+    def calcular_objetivo_sl_exchange(self, pos: Posicion) -> float:
+        """V6.3.1 Cota Inferior Invariante de Break-Even en Bybit:
+        Garantiza que una vez activado el Micro-Break-Even o el Trailing Stop, el Stop-Loss
+        enviado a Bybit (`sl_exchange`) JAMÁS quede por debajo de `entrada * (1 + BE_PISO_EXCHANGE_PCT)` (+0.10%),
+        eliminando pérdidas por cierres `SL_EXCHANGE` durante micro-cortes de WebSocket.
+        """
+        piso_be = pos.entrada * (1.0 + float(getattr(cfg, "BE_PISO_EXCHANGE_PCT", 0.0010)))
+        con_margen = pos.sl * (1.0 - MARGEN_SL_EXCHANGE)
+        if pos.be_activo or pos.trailing_activo:
+            return max(piso_be, con_margen)
+        return con_margen
 
     def abrir(
         self,
@@ -119,13 +132,7 @@ class PositionManager:
         return pos
 
     async def evacuar_por_emergencia_macro(self, exchange, motivo_macro: str = "MACRO_CRASH") -> int:
-        """V6.3.0 Neutralización Instantánea de Beta en Crash Macro / Contagio:
-        Recorre todas las posiciones abiertas en el milisegundo en que colapsa BTC o salta el
-        Breadth Contagion Breaker:
-        - Si la posición está en pérdida o aún no aseguró ganancia neta, la cierra a mercado de inmediato.
-        - Si la posición está en ganancia holgada (> BE_OFFSET_PCT), ciñe su SL interno al bid actual
-          o la liquida para impedir que el contagio borre el beneficio.
-        """
+        """V6.3.0+ Neutralización Instantánea de Beta en Crash Macro / Contagio."""
         activas = list(self.posiciones.values())
         if not activas:
             return 0
@@ -258,13 +265,13 @@ class PositionManager:
         pos.max_precio = max(pos.max_precio, bid)
         tiempo_hold = ahora - pos.t_apertura
 
-        # 1. Micro-Break-Even V6.3.0: +0.48% -> Asegura entrada + 0.12% (elimina el Valle de la Muerte)
+        # 1. Micro-Break-Even V6.3.1: +0.48% -> Asegura entrada + 0.16% interno y >= +0.10% en Bybit
         if not pos.be_activo and pnl >= cfg.BE_ACTIVACION_PCT:
             pos.be_activo = True
             pos.sl = max(pos.sl, pos.entrada * (1.0 + cfg.BE_OFFSET_PCT))
             print(f"[FRANCOTIRADOR] 🛡️ {pos.symbol} Micro-Break-Even armado: SL {pos.sl:.6g} (PnL {pnl:+.2%})")
 
-        # 2. Trailing Stop Ágil V6.3.0: +0.80% -> Rastrear el máximo a distancia de 0.35%
+        # 2. Trailing Stop Ágil V6.3.1: +0.80% -> Rastrear el máximo a distancia de 0.35%
         if not pos.trailing_activo and pnl >= cfg.TRAIL_ACTIVACION_PCT:
             pos.trailing_activo = True
             print(f"[FRANCOTIRADOR] 🧲 {pos.symbol} Trailing Stop activado (PnL {pnl:+.2%})")
@@ -300,11 +307,12 @@ class PositionManager:
         if motivo and ahora >= pos.t_reintento:
             return await self.cerrar(exchange, pos, motivo, bid)
 
-        # 4. Sincronizar SL en Bybit de forma asíncrona hacia arriba
-        objetivo = pos.sl * (1.0 - MARGEN_SL_EXCHANGE)
+        # 4. Sincronizar SL en Bybit hacia arriba garantizando el piso positivo BE_PISO_EXCHANGE_PCT
+        objetivo = self.calcular_objetivo_sl_exchange(pos)
         if (
             (pos.be_activo or pos.trailing_activo)
             and objetivo > pos.sl_exchange
+            and objetivo < bid
             and ahora - pos.t_ult_sync >= cfg.SYNC_SL_EXCHANGE_SEG
         ):
             await self._sync_sl_exchange(exchange, pos, objetivo)
@@ -318,7 +326,10 @@ class PositionManager:
     async def _sync_sl_exchange(self, exchange, pos: Posicion, objetivo: float) -> None:
         try:
             precio = exchange.price_to_precision(pos.symbol, objetivo)
-            if float(precio) <= pos.sl_exchange:
+            precio_f = float(precio)
+            if precio_f <= pos.sl_exchange:
+                return
+            if (pos.be_activo or pos.trailing_activo) and precio_f <= pos.entrada:
                 return
             pos.t_ult_sync = time.time()
             await exchange.privatePostV5PositionTradingStop({
@@ -328,7 +339,7 @@ class PositionManager:
                 "tpslMode": "Full",
                 "positionIdx": 0,
             })
-            pos.sl_exchange = float(precio)
+            pos.sl_exchange = precio_f
             print(f"[FRANCOTIRADOR] SL de Bybit en {pos.symbol} ajustado a {precio}")
         except Exception as e:
             if "34040" in str(e):
@@ -407,7 +418,6 @@ class PositionManager:
         self, exchange, pos: Posicion, motivo: str, salida: float, cantidad: float
     ) -> None:
         try:
-            # 1. Activar cuarentena post-cierre de 300s (salvo en limpieza de boot heredado)
             if motivo != "ESCAPE_HUERFANA_BOOT":
                 self.registrar_cooldown_post_cierre(pos.symbol)
 
@@ -441,7 +451,6 @@ class PositionManager:
                 f"{pnl_pct:+.2f} % ({pnl_usdt:+.4f} USDT) en {hold:.0f}s"
             )
 
-            # 2. Sincronizar saldo libre en RAM inmediatamente y despachar alerta sin bloquear
             sniper_mod = importlib.import_module("3_ejecutor_sniper")
             sniper_mod.disparar_sincronizacion_saldo_bg(exchange)
             await enviar_alerta(
