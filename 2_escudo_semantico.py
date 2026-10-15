@@ -1,237 +1,246 @@
-"""Escudo Semántico LPU Desacoplado en RAM (SPLITBRAIN V6.3.0).
-
-Incorpora Rotación Automática Multi-Modelo ante Error HTTP 429 (agotamiento de cuota TPD)
-entre `openai/gpt-oss-20b`, `llama-3.3-70b-versatile` y `llama-3.1-8b-instant`, manteniendo
-lectura Lock-Free O(1) en ~0.65 microsegundos mediante `frozenset` en memoria RAM.
+"""Escudo Semántico y Cuantitativo en Background (O(1) RAM Lookup + Rotación Multi-Modelo Groq).
+Optimizado para el catálogo real de Groq del usuario:
+1. openai/gpt-oss-20b  (8K TPM / 200K TPD / 1K RPD)
+2. qwen/qwen3.8-27b    (8K TPM / 200K TPD / 1K RPD)
+3. openai/gpt-oss-120b (8K TPM / 200K TPD / 1K RPD)
+4. allam-2-7b          (6K TPM / 500K TPD / 7K RPD)
 """
 import asyncio
 import json
+import re
 import time
-from typing import Any, Dict, FrozenSet, Iterable, Optional, Set, Tuple
+from typing import Dict, List, Set
 
 from groq import AsyncGroq
 import config_parametros as cfg
 
-MODELO = "openai/gpt-oss-20b"
-_cliente: Optional[AsyncGroq] = None
+cliente_groq = AsyncGroq(api_key=cfg.GROQ_API_KEY) if cfg.GROQ_API_KEY else None
+
+_RE_THINK = re.compile(r"<think>.*?</think>", flags=re.DOTALL | re.IGNORECASE)
 
 
-def _obtener_cliente() -> AsyncGroq:
-    """Creación diferida: evita lanzar excepción en tiempo de importación si falta GROQ_API_KEY."""
-    global _cliente
-    if _cliente is None:
-        _cliente = AsyncGroq(
-            api_key=cfg.GROQ_API_KEY,
-            timeout=getattr(cfg, "GROQ_TIMEOUT_SEG", 6.0),
-            max_retries=0,
-        )
-    return _cliente
+def _extraer_json_robusto(contenido: str) -> dict:
+    """Extrae el diccionario JSON incluso si el modelo (ej. qwen/qwen3.8-27b o allam-2-7b)
+    incluye etiquetas de razonamiento <think>...</think> o bloques Markdown ```json ... ```.
+    """
+    if not contenido:
+        return {}
+    limpio = _RE_THINK.sub("", contenido).strip()
+    try:
+        return json.loads(limpio)
+    except Exception:
+        pass
+    inicio = limpio.find("{")
+    fin = limpio.rfind("}")
+    if inicio != -1 and fin != -1 and fin > inicio:
+        try:
+            return json.loads(limpio[inicio : fin + 1])
+        except Exception:
+            return {}
+    return {}
 
 
-def _parametros_modelo(modelo: str) -> Dict[str, Any]:
-    """Ajusta los parámetros específicos según la familia de modelo en Groq LPU."""
-    base: Dict[str, Any] = {
-        "response_format": {"type": "json_object"},
-        "temperature": 0.1,
-        "max_completion_tokens": 1024,
-    }
-    if "gpt-oss" in modelo:
-        base["reasoning_effort"] = "low"
-        base["include_reasoning"] = False
-    return base
-
-
-class CentinelaGroqRAM:
-    """Mantiene una Whitelist inmutable (`frozenset`) en RAM con Failover Multi-Modelo en Groq."""
+class CentinelaSemanticoRAM:
+    """Mantiene en memoria RAM la Whitelist de activos operables.
+    - La ruta crítica de trading consulta `esta_aprobado(symbol)` en O(1) (< 0.001 ms, CERO red).
+    - Un demonio asíncrono audita la telemetría cada GROQ_CICLO_SEG (180s) fuera de la ruta crítica
+      y rota automáticamente entre los 4 modelos generativos habilitados en la cuenta Groq.
+    """
 
     def __init__(self) -> None:
-        self._universo: Set[str] = set()
-        self._whitelist_ram: FrozenSet[str] = frozenset()
-        self._telemetria: Dict[str, Dict[str, float]] = {}
-        self._ultima_actualizacion: float = 0.0
-        self._idx_modelo_preferido: int = 0
+        self.whitelist_activa: Set[str] = set()
+        self.telemetria_pares: Dict[str, Dict[str, float]] = {}
+        self.ultimo_update_ts: float = 0.0
+        self.universo_base: List[str] = []
+        self._modelo_idx: int = 0
 
-    def _lista_modelos(self) -> Tuple[str, ...]:
-        modelos = getattr(cfg, "GROQ_MODELOS", (MODELO,))
-        if isinstance(modelos, (list, tuple)) and len(modelos) > 0:
-            return tuple(str(m) for m in modelos)
-        return (MODELO,)
-
-    def inicializar_universo(self, simbolos: Iterable[str]) -> None:
-        """Carga inicial instantánea al arrancar main.py."""
-        limpios = {s for s in simbolos if s not in cfg.PROHIBIDAS and s not in cfg.BLACKLIST_PAIRS}
-        self._universo = set(limpios)
-        self._whitelist_ram = frozenset(limpios)
-        self._ultima_actualizacion = time.time()
-        print(f"[ESCUDO RAM] Whitelist O(1) inicializada con {len(self._whitelist_ram)} pares activos.")
+    def inicializar_universo(self, presas: List[str]) -> None:
+        """Habilita inicialmente las presas seleccionadas para no bloquear el arranque en frío."""
+        self.universo_base = list(presas)
+        self.whitelist_activa = set(presas)
+        ahora = time.time()
+        for sym in presas:
+            self.telemetria_pares.setdefault(
+                sym,
+                {"z_score": 0.0, "ofi": 0.0, "precio": 0.0, "cambio_pct": 0.0, "ts": ahora},
+            )
+        self.ultimo_update_ts = ahora
+        print(f"[ESCUDO RAM] Whitelist O(1) inicializada con {len(self.whitelist_activa)} pares activos.")
 
     def actualizar_telemetria(
-        self, symbol: str, z_score: float, ofi: float, precio: float, cambio_pct: float
+        self, symbol: str, z_score: float, ofi: float, precio: float, cambio_pct: float = 0.0
     ) -> None:
-        """Actualización O(1) en memoria alimentada por 1_radar_volatilidad.py en cada segundo."""
-        self._telemetria[symbol] = {
-            "z": round(float(z_score), 2),
-            "ofi": round(float(ofi), 2),
-            "price": float(precio),
-            "chg_pct": round(float(cambio_pct) * 100.0, 2),
+        """Actualiza en RAM (< 1 microsegundo) el estado microestructural del par observado por el Radar."""
+        self.telemetria_pares[symbol] = {
+            "z_score": round(float(z_score), 3),
+            "ofi": round(float(ofi), 3),
+            "precio": float(precio),
+            "cambio_pct": round(float(cambio_pct), 4),
+            "ts": time.time(),
         }
 
-    def es_aprobado_ram(self, symbol: str) -> bool:
-        """RUTA CRÍTICA (~0.65 µs): Verifica membresía O(1) sin red ni locks."""
-        if symbol in cfg.BLACKLIST_PAIRS or symbol in cfg.PROHIBIDAS:
+    def esta_aprobado(self, symbol: str) -> bool:
+        """Lookup O(1) en memoria RAM para la ruta crítica de disparo (0.000 ms de latencia de red)."""
+        if symbol in cfg.PROHIBIDAS or symbol in cfg.BLACKLIST_PAIRS:
             return False
-        return symbol in self._whitelist_ram
+        if not self.whitelist_activa:
+            return True
+        return symbol in self.whitelist_activa
 
     def _filtro_heuristico_respaldo(self) -> Set[str]:
-        """Fallback cuantitativo determinista si todos los modelos de Groq fallan o falta API Key."""
+        """Filtro cuantitativo determinista si Groq no está configurado o agota cuota en los 4 modelos:
+        veta activos con drenaje continuo sin absorción (caída >= 6% en ventana y OFI <= -0.75).
+        """
         aprobados: Set[str] = set()
-        for sym in self._universo:
-            if sym in cfg.BLACKLIST_PAIRS or sym in cfg.PROHIBIDAS:
+        for sym in self.universo_base:
+            if sym in cfg.PROHIBIDAS or sym in cfg.BLACKLIST_PAIRS:
                 continue
-            datos = self._telemetria.get(sym)
-            if datos is None:
-                aprobados.add(sym)
-                continue
-            # Aísla activos con drenaje estructural crónico (caída <= -6.0% en 60s con OFI <= -0.85)
-            if datos["chg_pct"] <= -6.0 and datos["ofi"] <= -0.85:
+            datos = self.telemetria_pares.get(sym) or {}
+            cambio = float(datos.get("cambio_pct") or 0.0)
+            ofi = float(datos.get("ofi") or 0.0)
+            if cambio <= -0.06 and ofi <= -0.75:
                 print(
                     f"[ESCUDO RAM] Fallback cuantitativo vetó a {sym} "
-                    f"(caída {datos['chg_pct']}%, OFI {datos['ofi']})"
+                    f"(caída {cambio:.1%}, OFI {ofi:+.2f})"
                 )
                 continue
             aprobados.add(sym)
-        return aprobados
+        return aprobados if aprobados else set(self.universo_base)
 
-    async def auditar_lote_groq(self) -> FrozenSet[str]:
-        """Consulta asíncrona por lote a Groq LPU con rotación automática multi-modelo ante Error 429."""
-        activos_validos = [
-            s for s in self._universo
-            if s not in cfg.BLACKLIST_PAIRS and s not in cfg.PROHIBIDAS
+    def _lista_modelos(self) -> List[str]:
+        pool = list(cfg.GROQ_MODEL_POOL)
+        if cfg.GROQ_MODEL and cfg.GROQ_MODEL not in pool:
+            pool.insert(0, cfg.GROQ_MODEL)
+        return pool
+
+    async def _llamar_modelo_groq(self, modelo: str, prompt_sistema: str, resumen_json: str) -> str:
+        """Invoca a Groq intentando primero JSON mode nativo; si el modelo (ej. allam-2-7b o qwen3.8-27b)
+        no soporta `response_format`, reintenta en el acto en modo texto puro.
+        """
+        mensajes = [
+            {"role": "system", "content": prompt_sistema},
+            {"role": "user", "content": f"Telemetría actual: {resumen_json}"},
         ]
-        if not activos_validos:
-            self._whitelist_ram = frozenset()
-            return self._whitelist_ram
+        try:
+            respuesta = await asyncio.wait_for(
+                cliente_groq.chat.completions.create(
+                    messages=mensajes,
+                    model=modelo,
+                    temperature=0.0,
+                    max_tokens=320,
+                    response_format={"type": "json_object"},
+                ),
+                timeout=cfg.GROQ_TIMEOUT_SEG,
+            )
+            return respuesta.choices[0].message.content or "{}"
+        except Exception as e_json:
+            err_str = str(e_json).lower()
+            if "response_format" in err_str or "json_validate_failed" in err_str or "400" in err_str:
+                respuesta = await asyncio.wait_for(
+                    cliente_groq.chat.completions.create(
+                        messages=mensajes,
+                        model=modelo,
+                        temperature=0.0,
+                        max_tokens=320,
+                    ),
+                    timeout=cfg.GROQ_TIMEOUT_SEG,
+                )
+                return respuesta.choices[0].message.content or "{}"
+            raise
 
-        snapshot_envio = {
-            s: self._telemetria.get(s, {"z": 0.0, "ofi": 0.0, "chg_pct": 0.0})
-            for s in activos_validos
+    async def auditar_universo_una_vez(self) -> Set[str]:
+        """Ejecuta una auditoría de lotes en background rotando modelos ante 429/404/503."""
+        if not self.universo_base:
+            return self.whitelist_activa
+
+        if cliente_groq is None:
+            self.whitelist_activa = self._filtro_heuristico_respaldo()
+            self.ultimo_update_ts = time.time()
+            return self.whitelist_activa
+
+        resumen_lote = {
+            sym: {
+                "z": self.telemetria_pares.get(sym, {}).get("z_score", 0.0),
+                "ofi": self.telemetria_pares.get(sym, {}).get("ofi", 0.0),
+                "ret": self.telemetria_pares.get(sym, {}).get("cambio_pct", 0.0),
+            }
+            for sym in self.universo_base
         }
-        prompt = (
-            "Eres un comité institucional de riesgo HFT en criptoderivados. "
-            "Analiza la siguiente telemetría en tiempo real de perpetuos USDT (z = Z-Score 60s, "
-            "ofi = Order Flow Imbalance [-1 a 1], chg_pct = variación % en 60s). "
-            "Aprueba los activos aptos para reversión a la media (pánico normal o mercado sano) "
-            "y excluye aquellos con señales de exploit, rugpull, depeg, cascada tóxica sin absorción "
-            "o colapso estructural (caídas extremas o presión vendedora persistente ofi < -0.80). "
-            f"Datos: {json.dumps(snapshot_envio, separators=(',', ':'))}. "
-            'Responde ÚNICAMENTE con JSON estricto con este esquema exacto: {"aprobados": ["SIMBOLO1", "SIMBOLO2"]}'
+
+        prompt_sistema = (
+            "Eres un Gestor de Riesgo Cuantitativo HFT en Bybit. "
+            "Recibirás un JSON con métricas en tiempo real (z: Z-score, ofi: Order Flow Imbalance, ret: retorno reciente) "
+            "de perpetuos cripto. Identifica únicamente activos que sufran colapso estructural sin absorción "
+            "(ret <= -0.06 y ofi <= -0.75 simultáneamente). "
+            'Responde ÚNICAMENTE con un objeto JSON válido con la clave "vetados" (lista de símbolos a bloquear). '
+            'Ejemplo exacto: {"vetados": []}'
         )
+        resumen_str = json.dumps(resumen_lote, separators=(",", ":"))
 
         modelos = self._lista_modelos()
         total_modelos = len(modelos)
-        ultimo_error: Optional[Exception] = None
 
-        for offset in range(total_modelos):
-            idx = (self._idx_modelo_preferido + offset) % total_modelos
+        for intento in range(total_modelos):
+            idx = (self._modelo_idx + intento) % total_modelos
             modelo_actual = modelos[idx]
-            t0 = time.perf_counter()
             try:
-                cliente = _obtener_cliente()
-                kwargs_extra = _parametros_modelo(modelo_actual)
-                resp = await cliente.chat.completions.create(
-                    model=modelo_actual,
-                    messages=[{"role": "user", "content": prompt}],
-                    **kwargs_extra,
-                )
-                contenido = resp.choices[0].message.content or "{}"
-                datos: Dict[str, Any] = json.loads(contenido)
-                lista_aprobados = datos.get("aprobados")
-                if isinstance(lista_aprobados, list):
-                    conjunto_nuevo = {
-                        str(s) for s in lista_aprobados
-                        if str(s) in self._universo
-                        and str(s) not in cfg.BLACKLIST_PAIRS
-                        and str(s) not in cfg.PROHIBIDAS
-                    }
-                    if not conjunto_nuevo and len(activos_validos) > 0:
-                        conjunto_nuevo = self._filtro_heuristico_respaldo()
-                else:
-                    conjunto_nuevo = self._filtro_heuristico_respaldo()
+                t0 = time.perf_counter()
+                contenido = await self._llamar_modelo_groq(modelo_actual, prompt_sistema, resumen_str)
+                latencia_ms = (time.perf_counter() - t0) * 1000.0
+                datos = _extraer_json_robusto(contenido)
+                vetados_raw = datos.get("vetados") or []
+                vetados = {str(s) for s in vetados_raw if isinstance(s, str)}
 
-                lat_ms = (time.perf_counter() - t0) * 1000.0
-                self._whitelist_ram = frozenset(conjunto_nuevo)
-                self._ultima_actualizacion = time.time()
-                self._idx_modelo_preferido = idx
+                nuevos_aprobados = {
+                    sym for sym in self.universo_base
+                    if sym not in vetados and sym not in cfg.PROHIBIDAS and sym not in cfg.BLACKLIST_PAIRS
+                }
+                self.whitelist_activa = nuevos_aprobados if nuevos_aprobados else self._filtro_heuristico_respaldo()
+                self.ultimo_update_ts = time.time()
+                self._modelo_idx = idx
                 print(
-                    f"[ESCUDO RAM] Whitelist actualizada vía Groq LPU ({modelo_actual}) en {lat_ms:.0f}ms "
-                    f"(fuera de ruta crítica): {len(self._whitelist_ram)}/{len(activos_validos)} aprobados."
+                    f"[ESCUDO RAM] Whitelist actualizada vía Groq LPU ({modelo_actual}) en {latencia_ms:.0f}ms "
+                    f"(fuera de ruta crítica): {len(self.whitelist_activa)}/{len(self.universo_base)} aprobados."
                 )
-                return self._whitelist_ram
+                return self.whitelist_activa
             except Exception as e:
-                ultimo_error = e
                 texto_err = str(e)
-                if "429" in texto_err or "rate_limit" in texto_err.lower():
-                    siguiente_idx = (idx + 1) % total_modelos
+                texto_low = texto_err.lower()
+                if any(k in texto_low for k in ("429", "rate_limit", "404", "not_found", "decommissioned", "503")):
+                    sig_idx = (idx + 1) % total_modelos
                     print(
-                        f"[ESCUDO RAM] Cuota/Rate-Limit 429 en `{modelo_actual}`. "
-                        f"Rotando automáticamente al modelo `{modelos[siguiente_idx]}`..."
+                        f"[ESCUDO RAM] Cuota/No-Disponible en `{modelo_actual}`. "
+                        f"Rotando automáticamente al modelo `{modelos[sig_idx]}`..."
                     )
                     continue
+                print(
+                    f"[ESCUDO RAM] Aviso Groq background ({type(e).__name__}: {e}). "
+                    f"Whitelist mantenida por heurística cuantitativa ({len(self.whitelist_activa)} activos)."
+                )
                 break
 
-        respaldo = self._filtro_heuristico_respaldo()
-        self._whitelist_ram = frozenset(respaldo)
-        self._ultima_actualizacion = time.time()
-        print(
-            f"[ESCUDO RAM] Aviso Groq background ({type(ultimo_error).__name__}: {ultimo_error}). "
-            f"Whitelist mantenida por heurística cuantitativa ({len(self._whitelist_ram)} activos)."
-        )
-        return self._whitelist_ram
+        self.whitelist_activa = self._filtro_heuristico_respaldo()
+        self.ultimo_update_ts = time.time()
+        return self.whitelist_activa
 
-    async def bucle_centinela_background(self, intervalo_seg: Optional[float] = None) -> None:
-        """Tarea demonio perpetua invocada desde main.py."""
-        ciclo = intervalo_seg or getattr(cfg, "GROQ_CICLO_SEG", 180)
-        await asyncio.sleep(15)
+    async def bucle_centinela_background(self, intervalo_seg: float = cfg.GROQ_CICLO_SEG) -> None:
+        """Demonio infinito en segundo plano. Jamás interrumpe al motor de ejecución."""
+        await asyncio.sleep(15.0)
         while True:
             try:
-                await self.auditar_lote_groq()
+                await self.auditar_universo_una_vez()
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 print(f"[ESCUDO RAM] Error inesperado en bucle centinela: {type(e).__name__}: {e}")
-            await asyncio.sleep(ciclo)
+            await asyncio.sleep(intervalo_seg)
 
 
-centinela = CentinelaGroqRAM()
+centinela = CentinelaSemanticoRAM()
 
 
-def es_aprobado_ram(symbol: str) -> bool:
-    """Acceso directo O(1) para 1_radar_volatilidad.py."""
-    return centinela.es_aprobado_ram(symbol)
-
-
-async def evaluar_anomalia_groq(symbol: str) -> bool:
-    """Retrocompatibilidad O(1): resuelve instantáneamente desde RAM en ~0.65 µs sin I/O de red."""
-    if not centinela._universo:
-        for modelo_actual in centinela._lista_modelos():
-            try:
-                cliente = _obtener_cliente()
-                kwargs_extra = _parametros_modelo(modelo_actual)
-                resp = await cliente.chat.completions.create(
-                    model=modelo_actual,
-                    messages=[{"role": "user", "content": (
-                        f"Eres un analista de riesgos HFT. El activo {symbol} ha colapsado. "
-                        "Evalúa si es un pánico irracional (APROBADO) o un hackeo/fraude estructural (RECHAZADO). "
-                        'Responde ÚNICAMENTE con JSON estricto: {"aprobado": true} o {"aprobado": false}.'
-                    )}],
-                    **kwargs_extra,
-                )
-                datos = json.loads(resp.choices[0].message.content or "{}")
-                return datos.get("aprobado") is True
-            except Exception as e:
-                if "429" in str(e) or "rate_limit" in str(e).lower():
-                    continue
-                print(f"[ESCUDO (Groq)] Fallo evaluando {symbol}: {type(e).__name__}: {e}")
-                return False
-        return False
-    return centinela.es_aprobado_ram(symbol)
+async def evaluar_anomalia_groq(symbol: str, contexto_mercado: str = "") -> bool:
+    """Interfaz O(1) en RAM (< 0.001 ms).
+    Elimina por completo el bloqueo HTTP de 510-792ms de la ruta crítica de disparo.
+    """
+    return centinela.esta_aprobado(symbol)
