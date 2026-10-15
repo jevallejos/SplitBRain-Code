@@ -1,6 +1,10 @@
-"""Ejecutor Sniper SPLITBRAIN V6.2.4: Zero-REST Critical Path & Fire-and-Forget Telemetry."""
+"""Ejecutor Sniper SPLITBRAIN V6.3.0:
+Zero-REST Critical Path, Cotización Discreta de Bertrand (Penny-Jump Best-Bid + 1 Tick),
+Warm-Socket Keep-Alive para Tokio (asia-northeast1) y Ecuación HJB Real de Avellaneda-Stoikov.
+"""
 import asyncio
 import importlib
+import math
 import re
 import time
 from decimal import ROUND_FLOOR, Decimal
@@ -14,13 +18,13 @@ _stats = importlib.import_module("6_stats_tracker")
 
 MIN_INVERSION_USDT = getattr(cfg, "MIN_INVERSION_USDT", 2.0)
 
-# Motor de salidas Avellaneda-Stoikov (V6.0 / V6.1)
-ESPERA_LLENADO_SEG = 30   # máx. espera a que la compra maker se llene
-INTERVALO_AS_SEG = 2      # evaluar la física del mercado cada 2 segundos
-_tareas_as: set[asyncio.Task] = set()   # referencias fuertes para tareas de gestión de salida
-_tareas_bg: set[asyncio.Task] = set()   # referencias fuertes para alertas y syncs Fire-and-Forget
+# Tiempos de espera y ciclo de salida (V6.3.0: espera reducida de 30s a 10s)
+ESPERA_LLENADO_SEG = getattr(cfg, "ESPERA_LLENADO_SEG", 10)
+INTERVALO_AS_SEG = 2
+_tareas_as: set[asyncio.Task] = set()
+_tareas_bg: set[asyncio.Task] = set()
 
-# Estado de vuelo y caché O(1) en RAM (V6.2.4)
+# Estado de vuelo y caché O(1) en RAM
 _en_vuelo: set[str] = set()
 _apalancamiento_ok: set[str] = set()
 _lock_disparo = asyncio.Lock()
@@ -68,6 +72,25 @@ def disparar_sincronizacion_saldo_bg(exchange) -> None:
         _lanzar_bg(sincronizar_saldo_ram(exchange))
 
 
+async def bucle_keepalive_socket(exchange) -> None:
+    """V6.3.0 Warm-Socket Keep-Alive:
+    Refresca periódicamente la sesión HTTP/TLS privada y el caché `_saldo_libre_ram` cada 45s
+    cuando no hay órdenes en vuelo, eliminando el handshake TCP+TLS en frío (~150-300ms) en Tokio.
+    """
+    intervalo = float(getattr(cfg, "KEEPALIVE_SOCKET_SEG", 45.0))
+    while True:
+        await asyncio.sleep(intervalo)
+        if cfg.MODO_PAPER or exchange is None:
+            continue
+        try:
+            if not _en_vuelo:
+                await sincronizar_saldo_ram(exchange)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+
+
 async def precalentar_apalancamiento_universo(exchange, simbolos: Iterable[str]) -> None:
     """Pre-configura el apalancamiento en el arranque para evitar llamadas REST en el disparo."""
     if cfg.MODO_PAPER:
@@ -86,8 +109,13 @@ async def precalentar_apalancamiento_universo(exchange, simbolos: Iterable[str])
 
 
 def posicion_activa(symbol: str) -> bool:
-    """True si el par tiene una compra en curso o una posición gestionada (trailing o AS)."""
+    """True si el par tiene una compra en curso o una posición gestionada."""
     return symbol in _en_vuelo or _gestor_mod.gestor.tiene(symbol)
+
+
+def en_cooldown_post_cierre(symbol: str) -> bool:
+    """True si el símbolo se encuentra en cuarentena de 300s tras haber cerrado una posición."""
+    return _gestor_mod.gestor.en_cooldown(symbol)
 
 
 def _d(x) -> Decimal:
@@ -134,15 +162,43 @@ async def _fijar_apalancamiento(exchange, symbol: str) -> None:
     _apalancamiento_ok.add(symbol)
 
 
-def _extraer_precio_maker_ws(exchange, symbol: str, ticker_ws: Optional[dict]) -> Optional[float]:
-    """Obtiene min(last, bid) en O(1) desde el tick de WebSocket sin hacer fetch_ticker REST."""
+def _extraer_precio_maker_ws(
+    exchange, symbol: str, ticker_ws: Optional[dict], ofi: Optional[float] = None
+) -> Optional[float]:
+    """V6.3.0 Cotización Discreta de Bertrand (Best-Bid & Penny-Jump):
+    - Si `ask` y `bid` están presentes en el stream WebSocket y el spread es >= 2 ticks
+      con OFI >= PENNY_JUMP_OFI_MIN (+0.25), cotiza en `best_bid + 1 tick` para encabezar la cola
+      de prioridad manteniendo 100% la garantía PostOnly (`best_bid + tick < best_ask`).
+    - Si `ask` está presente pero el spread es de 1 tick, cotiza en `best_bid`.
+    - Si `ask` no está presente (ej. mocks de prueba unitaria), usa `min(last, bid)` por seguridad.
+    """
     t = ticker_ws
     if not t and hasattr(exchange, "tickers") and isinstance(exchange.tickers, dict):
         t = exchange.tickers.get(symbol)
     if not t:
         return None
+
     last = t.get("last")
     bid = t.get("bid")
+    ask = t.get("ask")
+
+    if bid is not None and ask is not None and bid > 0 and ask > bid:
+        try:
+            m = exchange.market(symbol)
+            tick = float(m["precision"]["price"])
+            if (
+                tick > 0
+                and (ask - bid) >= (2.0 * tick - 1e-12)
+                and ofi is not None
+                and ofi >= cfg.PENNY_JUMP_OFI_MIN
+            ):
+                candidato = bid + tick
+                if candidato < ask:
+                    return float(candidato)
+        except Exception:
+            pass
+        return float(bid)
+
     if last is not None and bid is not None and last > 0 and bid > 0:
         return float(min(last, bid))
     if bid is not None and bid > 0:
@@ -152,17 +208,27 @@ def _extraer_precio_maker_ws(exchange, symbol: str, ticker_ws: Optional[dict]) -
     return None
 
 
-async def ejecutar_orden_sniper(exchange, symbol, z_score, ofi=None, ticker: Optional[dict] = None):
+async def ejecutar_orden_sniper(
+    exchange,
+    symbol: str,
+    z_score: float,
+    ofi: Optional[float] = None,
+    ticker: Optional[dict] = None,
+    sigma_rel: Optional[float] = None,
+) -> None:
     global _saldo_libre_ram
     if cfg.MODO_PAPER:
-        print(f"[PAPER TRADING] Ejecución simulada en {symbol} (Z={z_score:.2f}, OFI={ofi if ofi is None else round(ofi, 2)})")
+        print(
+            f"[PAPER TRADING] Ejecución simulada en {symbol} "
+            f"(Z={z_score:.2f}, OFI={ofi if ofi is None else round(ofi, 2)})"
+        )
         return
-    if symbol in cfg.BLACKLIST_PAIRS or posicion_activa(symbol):
-        print(f"[FRANCOTIRADOR] {symbol} no disparable (lista negra o posición activa).")
+    if symbol in cfg.BLACKLIST_PAIRS or posicion_activa(symbol) or en_cooldown_post_cierre(symbol):
+        print(f"[FRANCOTIRADOR] {symbol} no disparable (lista negra, posición activa o cooldown post-cierre).")
         return
 
     async with _lock_disparo:
-        if symbol in cfg.BLACKLIST_PAIRS or posicion_activa(symbol):
+        if symbol in cfg.BLACKLIST_PAIRS or posicion_activa(symbol) or en_cooldown_post_cierre(symbol):
             return
 
         t_disparo_ns = time.perf_counter_ns()
@@ -177,7 +243,6 @@ async def ejecutar_orden_sniper(exchange, symbol, z_score, ofi=None, ticker: Opt
             libre = float(_saldo_libre_ram or 0.0)
             inversion = libre * cfg.KELLY_MAX_PCT
 
-            # Si el caché RAM indica saldo bajo pero pasaron > 2s, verificar si un cierre liberó margen
             if inversion < MIN_INVERSION_USDT and (time.time() - _saldo_ts) >= _SALDO_FALLBACK_TTL_SEG:
                 libre = await sincronizar_saldo_ram(exchange)
                 inversion = libre * cfg.KELLY_MAX_PCT
@@ -190,8 +255,8 @@ async def ejecutar_orden_sniper(exchange, symbol, z_score, ofi=None, ticker: Opt
                 return
             nocional = inversion * cfg.APALANCAMIENTO
 
-            # 2. Precio de disparo directo del stream WebSocket en RAM (fallback a REST solo si no existe)
-            precio_ref = _extraer_precio_maker_ws(exchange, symbol, ticker)
+            # 2. Precio de disparo desde WebSocket con lógica Best-Bid / Penny-Jump O(1)
+            precio_ref = _extraer_precio_maker_ws(exchange, symbol, ticker, ofi=ofi)
             if precio_ref is None:
                 t_rest = await exchange.fetch_ticker(symbol)
                 last, bid = t_rest.get("last"), t_rest.get("bid")
@@ -205,7 +270,7 @@ async def ejecutar_orden_sniper(exchange, symbol, z_score, ofi=None, ticker: Opt
             precio_tp = exchange.price_to_precision(symbol, float(price) * (1 + cfg.TP_PCT))
             precio_sl = exchange.price_to_precision(symbol, float(price) * (1 - cfg.SL_PCT))
 
-            # 4. Apalancamiento O(1) (pre-calentado en arranque) + Única llamada de red: create_order
+            # 4. Apalancamiento O(1) (pre-calentado) + Única llamada de red: create_order
             await _fijar_apalancamiento(exchange, symbol)
             params = {"timeInForce": "PostOnly", "stopLoss": str(precio_sl)}
             orden = await exchange.create_order(symbol, "limit", "buy", amount, price, params)
@@ -229,7 +294,9 @@ async def ejecutar_orden_sniper(exchange, symbol, z_score, ofi=None, ticker: Opt
     # 5. PRIORIDAD ABSOLUTA: Iniciar vigilancia de la orden ANTES de enviar telemetría a Telegram
     if cfg.MOTOR_SALIDA == "AS":
         tarea = asyncio.create_task(
-            motor_salida_avellaneda_stoikov(exchange, symbol, amount, price, orden["id"], z_score, ofi)
+            motor_salida_avellaneda_stoikov(
+                exchange, symbol, amount, price, orden["id"], z_score, ofi, sigma_rel=sigma_rel
+            )
         )
     else:
         tarea = asyncio.create_task(_entregar_al_gestor(exchange, symbol, orden["id"], price, z_score, ofi))
@@ -247,12 +314,12 @@ async def ejecutar_orden_sniper(exchange, symbol, z_score, ofi=None, ticker: Opt
     )
 
 
-async def _entregar_al_gestor(exchange, symbol, id_compra, price, z_score, ofi):
-    """Espera el llenado real de la compra y entrega la posición al PositionManager (V6.1+)."""
+async def _entregar_al_gestor(exchange, symbol: str, id_compra: str, price: str, z_score: float, ofi: Optional[float]):
+    """Espera el llenado real de la compra (máx 10s en V6.3.0) y entrega la posición al PositionManager."""
     try:
         llenado, medio = await _esperar_llenado_detalle(exchange, symbol, id_compra)
         if llenado <= 0:
-            print(f"[FRANCOTIRADOR] Compra en {symbol} no llenada: sin posición que gestionar.")
+            print(f"[FRANCOTIRADOR] Compra en {symbol} no llenada en {ESPERA_LLENADO_SEG}s: margen liberado.")
             await sincronizar_saldo_ram(exchange)
             return
         _gestor_mod.gestor.abrir(exchange, symbol, llenado, medio or float(price), z_score, ofi)
@@ -264,11 +331,11 @@ async def _entregar_al_gestor(exchange, symbol, id_compra, price, z_score, ofi):
         disparar_sincronizacion_saldo_bg(exchange)
 
 
-async def _estado_orden(exchange, order_id, symbol):
+async def _estado_orden(exchange, order_id: str, symbol: str) -> dict:
     return await exchange.fetch_order(order_id, symbol, {"acknowledged": True})
 
 
-async def _posicion_larga(exchange, symbol):
+async def _posicion_larga(exchange, symbol: str) -> Optional[float]:
     """Tamaño de la posición larga abierta (0 si no hay). None si la API falla."""
     try:
         posiciones = await exchange.fetch_positions([symbol])
@@ -282,9 +349,9 @@ async def _posicion_larga(exchange, symbol):
     return total
 
 
-async def _esperar_llenado_detalle(exchange, symbol, id_compra) -> tuple[float, Optional[float]]:
+async def _esperar_llenado_detalle(exchange, symbol: str, id_compra: str) -> tuple[float, Optional[float]]:
     """(cantidad realmente comprada, precio medio). (0, None) si no se llenó. Cancela el resto al expirar."""
-    def _resultado(o):
+    def _resultado(o: dict) -> tuple[float, Optional[float]]:
         medio = o.get("average") or o.get("price")
         return float(o.get("filled") or 0), (float(medio) if medio else None)
 
@@ -308,9 +375,38 @@ async def _esperar_llenado_detalle(exchange, symbol, id_compra) -> tuple[float, 
         return 0.0, None
 
 
-async def _esperar_llenado_compra(exchange, symbol, id_compra):
+async def _esperar_llenado_compra(exchange, symbol: str, id_compra: str) -> float:
     """Devuelve la cantidad realmente comprada (0 si no se llenó). Cancela el resto al expirar."""
     return (await _esperar_llenado_detalle(exchange, symbol, id_compra))[0]
+
+
+def calcular_precio_salida_hjb_as(
+    s_mid: float,
+    entry: float,
+    q_norm: float,
+    sigma_rel: float,
+    t_restante: float,
+    t_total: float,
+) -> float:
+    """Ecuación HJB de Avellaneda-Stoikov (2008) para liquidación pasiva de inventario:
+        r(s, q, t) = s - q * gamma * sigma^2 * (T - t)
+        delta_ask  = r(s, q, t) - s + (1 / gamma) * ln(1 + gamma / k)
+    Combina el precio de reserva dinámico sobre el mid-price actual `s_mid` con una rampa
+    superior acotada por `entry * (1 + TP_PCT)` en t=0 que converge hacia `r(s, q, t)`.
+    """
+    gamma = float(getattr(cfg, "GAMMA_AS", 0.05))
+    kappa = float(getattr(cfg, "KAPPA_AS", 1.5))
+    tau = max(0.0, min(1.0, t_restante / max(t_total, 1.0)))
+    sigma_eff = max(float(sigma_rel), getattr(cfg, "STD_REL_FLOOR", 0.0005))
+
+    # Precio de reserva relativo según ecuación HJB de Avellaneda-Stoikov
+    reserva_as = s_mid * (1.0 - q_norm * gamma * (sigma_eff ** 2) * max(t_restante, 0.0))
+    spread_optimo_rel = min(0.0045, (1.0 / max(gamma, 1e-4)) * math.log(1.0 + gamma / max(kappa, 1e-4)) * 1e-3)
+    ask_hjb = reserva_as * (1.0 + spread_optimo_rel)
+
+    # Interpolación suave entre el objetivo inicial y la superficie HJB de reserva
+    techo_dinamico = entry * (1.0 + cfg.TP_PCT * tau)
+    return min(techo_dinamico, max(ask_hjb, entry * (1.0 + cfg.BE_OFFSET_PCT)))
 
 
 async def _registrar_cierre_as(
@@ -325,8 +421,9 @@ async def _registrar_cierre_as(
     ofi: Optional[float],
     es_maker_salida: bool,
 ) -> None:
-    """Registra las operaciones del motor AS en la Caja Negra y refresca el saldo en RAM."""
+    """Registra las operaciones del motor AS en la Caja Negra, activa Cooldown Post-Cierre y refresca RAM."""
     try:
+        _gestor_mod.gestor.registrar_cooldown_post_cierre(symbol)
         fee_out = cfg.FEE_MAKER if es_maker_salida else cfg.FEE_TAKER
         pnl_pct, pnl_usdt, fees = _stats.calcular_pnl(
             entrada, float(salida), float(cantidad), cfg.FEE_MAKER, fee_out
@@ -353,8 +450,15 @@ async def _registrar_cierre_as(
 
 
 async def motor_salida_avellaneda_stoikov(
-    exchange, symbol, amount, entry_price, id_compra=None, z_score=None, ofi=None
-):
+    exchange,
+    symbol: str,
+    amount,
+    entry_price,
+    id_compra: Optional[str] = None,
+    z_score: Optional[float] = None,
+    ofi: Optional[float] = None,
+    sigma_rel: Optional[float] = None,
+) -> None:
     try:
         if id_compra is not None:
             llenado, medio = await _esperar_llenado_detalle(exchange, symbol, id_compra)
@@ -367,10 +471,12 @@ async def motor_salida_avellaneda_stoikov(
                 entry_price = medio
 
         entry = float(entry_price)
+        cantidad_inicial = float(amount)
         tiempo_inicio = time.time()
-        precio_objetivo_max = entry * (1 + cfg.TP_PCT)
-        p_minimo_rentable = entry * 1.002
+        precio_objetivo_max = entry * (1.0 + cfg.TP_PCT)
+        p_minimo_rentable = entry * (1.0 + cfg.BE_OFFSET_PCT)
         salida = {"timeInForce": "PostOnly", "reduceOnly": True}
+        sigma_local = float(sigma_rel or getattr(cfg, "STD_REL_FLOOR", 0.0005))
 
         try:
             p_exit_format = exchange.price_to_precision(symbol, precio_objetivo_max)
@@ -384,6 +490,7 @@ async def motor_salida_avellaneda_stoikov(
         while True:
             await asyncio.sleep(INTERVALO_AS_SEG)
             tiempo_hold = time.time() - tiempo_inicio
+            t_restante = max(0.0, cfg.TIEMPO_MAX_HOLD_SEG - tiempo_hold)
 
             if tiempo_hold >= cfg.TIEMPO_MAX_HOLD_SEG:
                 try:
@@ -431,10 +538,18 @@ async def motor_salida_avellaneda_stoikov(
                     break
 
                 ticker = await exchange.fetch_ticker(symbol)
-                p_mid = float(ticker["last"])
+                p_mid = float(ticker.get("ask") or ticker.get("last") or entry)
+                restante = float(check_order.get("remaining") or restante)
+                q_norm = max(0.1, min(1.0, restante / max(cantidad_inicial, 1e-9)))
 
-                decaimiento = cfg.GAMMA_AS * (tiempo_hold / cfg.TIEMPO_MAX_HOLD_SEG) * entry
-                p_exit_dinamico = precio_objetivo_max - decaimiento
+                p_exit_dinamico = calcular_precio_salida_hjb_as(
+                    s_mid=p_mid,
+                    entry=entry,
+                    q_norm=q_norm,
+                    sigma_rel=sigma_local,
+                    t_restante=t_restante,
+                    t_total=float(cfg.TIEMPO_MAX_HOLD_SEG),
+                )
 
                 if estado in ("canceled", "rejected", "expired"):
                     posicion = await _posicion_larga(exchange, symbol)
@@ -443,23 +558,29 @@ async def motor_salida_avellaneda_stoikov(
                     if posicion <= 0:
                         print(f"[{symbol}] AS: posición cerrada externamente (SL); fin del motor.")
                         await _registrar_cierre_as(
-                            exchange, symbol, entry, entry * (1 - cfg.SL_PCT), float(amount),
+                            exchange, symbol, entry, entry * (1.0 - cfg.SL_PCT), float(amount),
                             "AS_SL_EXCHANGE", tiempo_inicio, z_score, ofi, es_maker_salida=False
                         )
                         break
                     restante = posicion
-                    p_reponer = max(p_exit_dinamico, p_minimo_rentable)
+                    p_reponer = max(p_exit_dinamico, p_minimo_rentable, p_mid)
                     p_exit_format = exchange.price_to_precision(symbol, p_reponer)
-                    orden_venta = await exchange.create_order(symbol, "limit", "sell", restante, float(p_exit_format), salida)
+                    orden_venta = await exchange.create_order(
+                        symbol, "limit", "sell", restante, float(p_exit_format), salida
+                    )
                     precio_orden_actual = float(p_exit_format)
                     continue
 
-                restante = float(check_order.get("remaining") or restante)
-
                 p_exit_format = exchange.price_to_precision(symbol, p_exit_dinamico)
-                if precio_orden_actual > float(p_exit_format) and p_exit_dinamico > p_mid and p_exit_dinamico > p_minimo_rentable:
+                if (
+                    precio_orden_actual > float(p_exit_format)
+                    and p_exit_dinamico > p_mid
+                    and p_exit_dinamico >= p_minimo_rentable
+                ):
                     await exchange.cancel_order(orden_venta["id"], symbol)
-                    orden_venta = await exchange.create_order(symbol, "limit", "sell", restante, float(p_exit_format), salida)
+                    orden_venta = await exchange.create_order(
+                        symbol, "limit", "sell", restante, float(p_exit_format), salida
+                    )
                     precio_orden_actual = float(p_exit_format)
             except Exception as e:
                 print(f"[{symbol}] AS transitorio: {type(e).__name__}: {e}")

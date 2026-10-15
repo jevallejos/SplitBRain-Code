@@ -1,4 +1,4 @@
-"""Cerebro Central SPLIT-BRAIN HFT (V6.2.4 Base Estable - Timestamped Logger + Zero-REST Sniper)."""
+"""Cerebro Central SPLIT-BRAIN HFT (V6.3.0 Anti-Contagio - Tokio asia-northeast1 + uvloop)."""
 import asyncio
 import importlib
 import os
@@ -7,6 +7,14 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+# Activación nativa de uvloop (libuv en C) en Linux antes de instanciar el bucle de eventos
+if sys.platform != "win32":
+    try:
+        import uvloop
+        uvloop.install()
+    except Exception:
+        pass
+
 import ccxt.pro as ccxt
 import config_parametros as cfg
 
@@ -14,6 +22,7 @@ _RAIZ = Path(__file__).resolve().parent
 LOG_FILE = _RAIZ / "bot_hft.log"
 LOCK_FILE = _RAIZ / ".splitbrain.lock"
 _lock_file_handle = None
+_lock_adquirido_por_mi: bool = False
 
 # Zona horaria de Chile Continental (UTC-3) y UTC+0 (Bybit Exchange Time)
 _TZ_CHILE = timezone(timedelta(hours=-3))
@@ -29,7 +38,7 @@ def _sello_tiempo() -> str:
 
 def adquirir_bloqueo_instancia_unica() -> None:
     """Garantiza la ejecución de exactamente una instancia física de Split-Brain (Cross-Platform)."""
-    global _lock_file_handle
+    global _lock_file_handle, _lock_adquirido_por_mi
     try:
         _lock_file_handle = LOCK_FILE.open("a+", encoding="utf-8")
         if sys.platform != "win32":
@@ -44,15 +53,25 @@ def adquirir_bloqueo_instancia_unica() -> None:
         _lock_file_handle.truncate()
         _lock_file_handle.write(f"{os.getpid()}\n")
         _lock_file_handle.flush()
+        _lock_adquirido_por_mi = True
     except (BlockingIOError, PermissionError, OSError):
+        _lock_adquirido_por_mi = False
+        if _lock_file_handle:
+            try:
+                _lock_file_handle.close()
+            except Exception:
+                pass
+            _lock_file_handle = None
         print(f"❌ [CRÍTICO] Ya existe una instancia activa de SPLITBRAIN ejecutándose (PID Lock en {LOCK_FILE.name}).")
         print("❌ [CRÍTICO] Abortando este proceso inmediatamente para evitar dobles disparos y colapso de margen.")
         sys.exit(1)
 
 
 def liberar_bloqueo_instancia_unica() -> None:
-    """Libera el cerrojo y elimina el archivo de bloqueo al apagar el bot limpiamente."""
-    global _lock_file_handle
+    """Libera el cerrojo y elimina el archivo SOLO si este proceso adquirió legítimamente el lock."""
+    global _lock_file_handle, _lock_adquirido_por_mi
+    if not _lock_adquirido_por_mi:
+        return
     if _lock_file_handle:
         try:
             if sys.platform != "win32":
@@ -65,11 +84,13 @@ def liberar_bloqueo_instancia_unica() -> None:
             _lock_file_handle.close()
         except Exception:
             pass
+        _lock_file_handle = None
     try:
         if LOCK_FILE.exists():
             LOCK_FILE.unlink()
     except Exception:
         pass
+    _lock_adquirido_por_mi = False
 
 
 class _TeeLogger:
@@ -168,6 +189,25 @@ def _es_perpetuo_cripto_puro(exchange, symbol: str) -> bool:
     return True
 
 
+def _es_lote_minimo_viable(exchange, symbol: str, ticker: dict, nocional_kelly_base: float) -> bool:
+    """V6.3.0 Filtro de Viabilidad de Lote Mínimo:
+    Descarta pares cuyo lote mínimo (`min_qty * last` o `step * last`) supere el
+    `MAX_MIN_QTY_KELLY_RATIO` (60%) del nocional Kelly base (ej. BTW ~$23.6, ZEC ~$11.0).
+    """
+    m = exchange.markets.get(symbol)
+    if not m:
+        return False
+    precio = float(ticker.get("last") or ticker.get("bid") or 0.0)
+    if precio <= 0:
+        return False
+    limits_amt = (m.get("limits") or {}).get("amount") or {}
+    prec_amt = (m.get("precision") or {}).get("amount") or 0.0
+    min_qty = max(float(limits_amt.get("min") or 0.0), float(prec_amt or 0.0))
+    costo_lote_minimo = min_qty * precio
+    umbral_max = max(5.2, nocional_kelly_base * float(getattr(cfg, "MAX_MIN_QTY_KELLY_RATIO", 0.60)))
+    return costo_lote_minimo <= umbral_max
+
+
 async def _inicializar_mercados_con_backoff(exchange) -> dict:
     ultimo_error = None
     for intento in range(1, REINTENTOS_ARRANQUE + 1):
@@ -186,11 +226,11 @@ async def _inicializar_mercados_con_backoff(exchange) -> dict:
     raise RuntimeError(f"Fallo crítico inicializando mercados tras {REINTENTOS_ARRANQUE} intentos: {ultimo_error}")
 
 
-async def _auditar_margen_libre(exchange) -> None:
-    """Inspecciona el balance USDT libre vs bloqueado e inicializa el caché RAM del Sniper."""
+async def _auditar_margen_libre(exchange) -> float:
+    """Inspecciona el balance USDT libre vs bloqueado, fija caché RAM y devuelve el nocional Kelly."""
     if cfg.MODO_PAPER:
-        await sniper.sincronizar_saldo_ram(exchange)
-        return
+        libre = await sniper.sincronizar_saldo_ram(exchange)
+        return libre * cfg.KELLY_MAX_PCT * cfg.APALANCAMIENTO
     try:
         bal = await exchange.fetch_balance()
         usdt = bal.get("USDT") or {}
@@ -200,21 +240,26 @@ async def _auditar_margen_libre(exchange) -> None:
         sniper._saldo_ts = time.time()
         usado = max(0.0, total - libre)
         margen_disparo = libre * cfg.KELLY_MAX_PCT
-        estado = "LISTO PARA DISPARAR" if margen_disparo >= 2.0 else "MUNICIÓN BAJA (< 2.0 USDT)"
+        nocional_kelly = max(total, libre) * cfg.KELLY_MAX_PCT * cfg.APALANCAMIENTO
+        estado = "LISTO PARA DISPARAR" if margen_disparo >= cfg.MIN_INVERSION_USDT else "MUNICIÓN BAJA (< 2.0 USDT)"
         print(
             f"[MAIN] Auditoría UTA USDT -> Total: {total:.4f} | Libre RAM: {libre:.4f} | "
-            f"Bloqueado: {usado:.4f} | Margen Kelly (35%): {margen_disparo:.2f} USDT [{estado}]"
+            f"Bloqueado: {usado:.4f} | Margen Kelly (35%): {margen_disparo:.2f} USDT "
+            f"(Nocional 3x: {nocional_kelly:.2f} USDT) [{estado}]"
         )
+        return nocional_kelly
     except Exception as e:
         print(f"[MAIN] Aviso leyendo margen libre: {type(e).__name__}: {e}")
+        return float(cfg.CAPITAL_BASE_USDT) * cfg.KELLY_MAX_PCT * cfg.APALANCAMIENTO
 
 
 async def main():
     adquirir_bloqueo_instancia_unica()
+    loop_name = type(asyncio.get_running_loop()).__name__
     print("==================================================================")
-    print("INICIANDO CEREBRO CENTRAL SPLIT-BRAIN HFT (V6.2.4 - BASE ESTABLE)")
+    print("INICIANDO CEREBRO CENTRAL SPLIT-BRAIN HFT (V6.3.0 - ANTI-CONTAGIO)")
     print("==================================================================")
-    print(f"[MAIN] Bloqueo de instancia física adquirido exitosamente (PID {os.getpid()}).")
+    print(f"[MAIN] Bloqueo de instancia física adquirido exitosamente (PID {os.getpid()} | Loop: {loop_name}).")
     print(f"[MAIN] Telemetría local con sellado de tiempo activa en: {LOG_FILE.name}")
 
     exchange = ccxt.bybit({
@@ -232,41 +277,61 @@ async def main():
     tareas: list[asyncio.Task] = []
     try:
         tickers = await _inicializar_mercados_con_backoff(exchange)
-        candidatos = [
+
+        # 0. Reconciliar posiciones huérfanas y auditar margen ANTES de elegir las 15 presas
+        await gestor_mod.gestor.reconciliar_posiciones_exchange(exchange)
+        nocional_kelly_base = await _auditar_margen_libre(exchange)
+
+        candidatos_puros = [
             t for sym, t in tickers.items()
             if _es_perpetuo_cripto_puro(exchange, sym)
         ]
-        candidatos.sort(key=lambda t: float(t.get("quoteVolume") or 0.0), reverse=True)
-        presas = [t["symbol"] for t in candidatos[:cfg.TOP_N]]
+        candidatos_puros.sort(key=lambda t: float(t.get("quoteVolume") or 0.0), reverse=True)
+
+        presas: list[str] = []
+        excluidos_lote: list[str] = []
+        for t in candidatos_puros:
+            sym = t["symbol"]
+            if _es_lote_minimo_viable(exchange, sym, t, nocional_kelly_base):
+                presas.append(sym)
+                if len(presas) >= cfg.TOP_N:
+                    break
+            else:
+                excluidos_lote.append(sym)
+
+        if excluidos_lote:
+            print(
+                f"[MAIN] Filtro de lote mínimo V6.3.0 excluyó pares indivisibles: "
+                f"{', '.join(excluidos_lote[:6])}"
+            )
 
         print(
             f"[MAIN] Modo Paper: {cfg.MODO_PAPER} | Motor Salida: {cfg.MOTOR_SALIDA} | "
-            f"Máx Hold: {cfg.TIEMPO_MAX_HOLD_SEG}s | OFI Min: {cfg.UMBRAL_OFI_TOXICO} | "
-            f"Apalancamiento: {cfg.APALANCAMIENTO}x"
+            f"Máx Hold: {cfg.TIEMPO_MAX_HOLD_SEG}s | Cooldown Post-Cierre: {cfg.COOLDOWN_POST_CIERRE_SEG}s | "
+            f"BE: +{cfg.BE_ACTIVACION_PCT:.2%} | Trail: +{cfg.TRAIL_ACTIVACION_PCT:.2%}"
         )
-        print(f"[MAIN] Radar fijado en {len(presas)} pares cripto-nativos.")
+        print(f"[MAIN] Radar fijado en {len(presas)} pares cripto-nativos viables.")
         print(f"[MAIN] Presas activas: {', '.join(presas)}")
 
-        # 0. Reconciliar posiciones huérfanas, pre-calentar apalancamiento y fijar saldo libre en RAM
-        await gestor_mod.gestor.reconciliar_posiciones_exchange(exchange)
         await sniper.precalentar_apalancamiento_universo(exchange, presas)
-        await _auditar_margen_libre(exchange)
-
         escudo.centinela.inicializar_universo(presas)
         stats.tracker.imprimir_dashboard(await stats.leer_balance_real(exchange))
-        sniper.enviar_alerta_bg("🟩 Motor SPLITBRAIN V6.2.4 (Base Estable + Timestamped Log) Inicializado.")
+        sniper.enviar_alerta_bg("🟩 Motor SPLITBRAIN V6.3.0 (Anti-Contagio + Tokio HFT) Inicializado.")
 
-        # 1. Tarea de Circuit Breaker Global BTC
+        # 1. Tarea de Circuit Breaker Global BTC con Evacuación Activa
         tareas.append(asyncio.create_task(radar.cazar_cisne_negro(exchange)))
 
-        # 2. Tarea Demonio Centinela Groq RAM en Background
+        # 2. Tarea Demonio Centinela Groq RAM con Rotación Multi-Modelo en Background
         tareas.append(asyncio.create_task(escudo.centinela.bucle_centinela_background(cfg.GROQ_CICLO_SEG)))
 
-        # 3. Tareas del Radar para cada par seleccionado
+        # 3. Tarea Warm-Socket Keep-Alive (mantiene sesión TLS caliente en asia-northeast1)
+        tareas.append(asyncio.create_task(sniper.bucle_keepalive_socket(exchange)))
+
+        # 4. Tareas del Radar para cada par seleccionado
         for symbol in presas:
             tareas.append(asyncio.create_task(vigilar_mercado(exchange, symbol)))
 
-        # 4. Tarea Periódica del Dashboard de la Caja Negra
+        # 5. Tarea Periódica del Dashboard de la Caja Negra
         tareas.append(asyncio.create_task(stats.bucle_dashboard(exchange, cfg.DASHBOARD_INTERVALO_SEG)))
 
         while True:

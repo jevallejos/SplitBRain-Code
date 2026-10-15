@@ -1,4 +1,4 @@
-"""Suite de Verificación Integrada para SplitBRain-Code V6.2.4 (8/8 Pruebas de Grado Producción)."""
+"""Suite de Verificación Integrada para SplitBRain-Code V6.3.0 (10/10 Pruebas de Grado Producción)."""
 import ast
 import asyncio
 import importlib
@@ -102,11 +102,11 @@ class _MockExchangeHuerfanas:
         return {"id": order_id, "status": "closed", "average": precios_mock.get(symbol, 1.0)}
 
     async def fetch_balance(self) -> Dict[str, Any]:
-        return {"USDT": {"total": 12.3663, "free": 12.3663}}
+        return {"USDT": {"total": 11.2365, "free": 11.2365}}
 
 
 class _MockExchangeZeroRest:
-    """Verifica que ejecutar_orden_sniper NO invoque REST (load_markets/fetch_ticker/set_leverage) antes de create_order."""
+    """Verifica que ejecutar_orden_sniper NO invoque REST antes de create_order y valide Penny-Jump."""
 
     def __init__(self) -> None:
         self.markets = {
@@ -130,7 +130,7 @@ class _MockExchangeZeroRest:
     async def fetch_balance(self) -> Dict[str, Any]:
         if self.create_order_en_ruta_critica:
             raise AssertionError("VIOLACIÓN ZERO-REST: fetch_balance() fue llamado antes de create_order()")
-        return {"USDT": {"total": 12.7007, "free": 8.4000}}
+        return {"USDT": {"total": 11.2365, "free": 11.2365}}
 
     def market(self, symbol: str) -> Dict[str, Any]:
         return self.markets[symbol]
@@ -161,18 +161,18 @@ class _MockExchangeZeroRest:
         return {"id": order_id, "status": "canceled", "filled": 0.0}
 
 
-async def ejecutar_auditoria_v6_2() -> None:
+async def ejecutar_auditoria_v6_3() -> None:
     print("==================================================================")
-    print("🧪 INICIANDO SUITE DE PRUEBAS INTEGRADA: SPLITBRAIN-CODE V6.2.4")
+    print("🧪 INICIANDO SUITE DE PRUEBAS INTEGRADA: SPLITBRAIN-CODE V6.3.0")
     print("==================================================================")
 
-    # 1. Verificación de compilación sintáctica de todos los módulos del repositorio
+    # 1. Verificación de compilación sintáctica de todos los módulos
     raiz = Path(__file__).resolve().parent
     for archivo in ARCHIVOS_PROYECTO:
         ruta = raiz / archivo
         assert ruta.exists(), f"Falta el archivo obligatorio: {archivo}"
         py_compile.compile(str(ruta), doraise=True)
-    print(f"✅ [1/8] Compilación exitosa de los {len(ARCHIVOS_PROYECTO)} módulos del repositorio.")
+    print(f"✅ [1/10] Compilación exitosa de los {len(ARCHIVOS_PROYECTO)} módulos del repositorio.")
 
     cfg = importlib.import_module("config_parametros")
     radar = importlib.import_module("1_radar_volatilidad")
@@ -182,65 +182,69 @@ async def ejecutar_auditoria_v6_2() -> None:
     stats_mod = importlib.import_module("6_stats_tracker")
     main_mod = importlib.import_module("main")
 
-    # 2. Auditoría AST de Contratos de Configuración + Verificación de UMBRAL_OFI_TOXICO = -0.35
+    # 2. Auditoría AST de Contratos de Configuración V6.3.0
     referencias_cfg = _extraer_atributos_cfg_ast(raiz)
     faltantes = [(arch, attr) for arch, attr in sorted(referencias_cfg) if not hasattr(cfg, attr)]
     assert not faltantes, f"Atributos faltantes en config_parametros.py: {faltantes}"
-    assert abs(cfg.UMBRAL_OFI_TOXICO - (-0.35)) < 1e-9, (
-        f"UMBRAL_OFI_TOXICO debía ser -0.35, recibido: {cfg.UMBRAL_OFI_TOXICO}"
-    )
+    assert abs(cfg.UMBRAL_OFI_TOXICO - (-0.35)) < 1e-9
+    assert abs(cfg.BE_ACTIVACION_PCT - 0.0048) < 1e-9
+    assert abs(cfg.TRAIL_ACTIVACION_PCT - 0.0080) < 1e-9
+    assert cfg.COOLDOWN_POST_CIERRE_SEG == 300
     atributos_unicos = {attr for _, attr in referencias_cfg}
     print(
-        f"✅ [2/8] Contrato AST validado: {len(atributos_unicos)} constantes verificadas "
-        f"(TP_PCT={cfg.TP_PCT}, UMBRAL_OFI_TOXICO={cfg.UMBRAL_OFI_TOXICO})."
+        f"✅ [2/10] Contrato AST V6.3.0 validado: {len(atributos_unicos)} constantes verificadas "
+        f"(BE={cfg.BE_ACTIVACION_PCT:.2%}, Trail={cfg.TRAIL_ACTIVACION_PCT:.2%}, CD={cfg.COOLDOWN_POST_CIERRE_SEG}s)."
     )
 
-    # 3. Prueba de Latencia Lock-Free O(1) en RAM del Centinela Groq
+    # 3. Prueba de Latencia Lock-Free O(1) en RAM del Centinela Groq + Lista Multi-Modelo
     presas_mock = ["SOL/USDT:USDT", "NEAR/USDT:USDT", "ADA/USDT:USDT", "ZEC/USDT:USDT"]
     escudo.centinela.inicializar_universo(presas_mock)
+    assert len(escudo.centinela._lista_modelos()) >= 3, "Deben existir al menos 3 modelos de failover en Groq"
 
     iteraciones = 10_000
     t0 = time.perf_counter_ns()
     for _ in range(iteraciones):
         aprobado = await escudo.evaluar_anomalia_groq("SOL/USDT:USDT")
     latencia_media_us = ((time.perf_counter_ns() - t0) / iteraciones) / 1000.0
-    assert aprobado is True, "SOL/USDT:USDT debía estar aprobado en RAM"
-    assert latencia_media_us < 50.0, f"Latencia excesiva en CPU: {latencia_media_us:.2f} µs"
-    print(f"✅ [3/8] Lookup O(1) en Whitelist RAM validado: {latencia_media_us:.3f} µs por consulta.")
+    assert aprobado is True
+    assert latencia_media_us < 50.0
+    print(
+        f"✅ [3/10] Lookup O(1) en Whitelist RAM ({latencia_media_us:.3f} µs) y pool de "
+        f"{len(escudo.centinela._lista_modelos())} modelos Groq validados."
+    )
 
     # 4. Prueba de Fallback Cuantitativo ante Drenaje Estructural (Anti-LUNA)
     escudo.centinela.actualizar_telemetria(
         "NEAR/USDT:USDT", z_score=-5.4, ofi=-0.92, precio=4.50, cambio_pct=-0.085
     )
     aprobados_fallback = escudo.centinela._filtro_heuristico_respaldo()
-    assert "NEAR/USDT:USDT" not in aprobados_fallback, "El fallback debió vetar el drenaje estructural de NEAR"
-    assert "SOL/USDT:USDT" in aprobados_fallback, "SOL debía permanecer aprobado"
-    print("✅ [4/8] Filtro anti-colapso estructural (Anti-LUNA) validado correctamente.")
+    assert "NEAR/USDT:USDT" not in aprobados_fallback
+    assert "SOL/USDT:USDT" in aprobados_fallback
+    print("✅ [4/10] Filtro anti-colapso estructural (Anti-LUNA) validado correctamente.")
 
-    # 5. Prueba de Inmunidad contra Micro-Ruido en Mercado Plano
+    # 5. Prueba de Inmunidad contra Micro-Ruido y Caída Desde Máximo
     vz = radar.VentanaZ(n=60)
     for _ in range(59):
         vz.push(83493.5)
     z_micro_ruido = vz.push(83459.2)
-    assert z_micro_ruido is not None and z_micro_ruido > -2.0, (
-        f"Un micro-ruido de -0.04% no debe disparar pánico (Z obtenido: {z_micro_ruido:.2f})"
-    )
+    assert z_micro_ruido is not None and z_micro_ruido > -2.0
+    assert vz.caida_desde_maximo() > cfg.CAIDA_MIN_PCT
 
     vz_panico = radar.VentanaZ(n=60)
     for _ in range(59):
         vz_panico.push(83493.5)
     z_panico_real = vz_panico.push(81650.0)
-    assert z_panico_real is not None and z_panico_real <= cfg.UMBRAL_PANICO, (
-        f"Un colapso real de -2.2% debe activar el gatillo (Z obtenido: {z_panico_real:.2f})"
-    )
+    assert z_panico_real is not None and z_panico_real <= cfg.UMBRAL_PANICO
+    assert vz_panico.caida_desde_maximo() <= cfg.CAIDA_MIN_PCT
     print(
-        f"✅ [5/8] Calibración VentanaZ verificada: Micro-ruido (-0.04%) -> Z={z_micro_ruido:.2f} (Ignorado) | "
-        f"Colapso Real (-2.2%) -> Z={z_panico_real:.2f} (Disparo)."
+        f"✅ [5/10] Calibración VentanaZ verificada: Micro-ruido (-0.04%) -> Z={z_micro_ruido:.2f} (Ignorado) | "
+        f"Colapso Real (-2.21%) -> Z={z_panico_real:.2f} (Disparo)."
     )
 
-    # 6. Prueba de Cerrojo Físico de Instancia Única (PID Lock en main.py)
+    # 6. Prueba de Cerrojo Físico de Instancia Única y Propiedad de Lock (PID Lock en main.py)
     main_mod.adquirir_bloqueo_instancia_unica()
-    assert main_mod.LOCK_FILE.exists(), "El archivo .splitbrain.lock no fue creado"
+    assert main_mod.LOCK_FILE.exists()
+    assert main_mod._lock_adquirido_por_mi is True
     segundo_handle = main_mod.LOCK_FILE.open("a+", encoding="utf-8")
     bloqueado_correctamente = False
     try:
@@ -256,16 +260,16 @@ async def ejecutar_auditoria_v6_2() -> None:
     finally:
         segundo_handle.close()
         main_mod.liberar_bloqueo_instancia_unica()
-    assert bloqueado_correctamente, "El cerrojo físico no bloqueó el segundo descriptor concurrente"
-    print("✅ [6/8] Cerrojo físico de instancia única (.splitbrain.lock) validado contra procesos duplicados.")
+    assert bloqueado_correctamente
+    print("✅ [6/10] Cerrojo físico de instancia única (.splitbrain.lock) con blindaje de propiedad validado.")
 
-    # 7. Prueba de Auto-Reconciliación de Posiciones Huérfanas (ADA, ENA, XRP)
+    # 7. Prueba de Auto-Reconciliación de Huérfanas, Evacuación Macro y Cooldown Post-Cierre (300s)
     ruta_original = stats_mod.tracker.ruta
     trades_originales = stats_mod.tracker._trades
     modo_paper_original = cfg.MODO_PAPER
     alerta_original_gestor = gestor_mod.enviar_alerta
     alerta_original_sniper = sniper.enviar_alerta
-    ruta_temp = raiz / ".test_stats_v6_2_4_tmp.jsonl"
+    ruta_temp = raiz / ".test_stats_v6_3_0_tmp.jsonl"
 
     async def _alerta_silenciosa(_msg: str) -> None:
         return None
@@ -280,18 +284,43 @@ async def ejecutar_auditoria_v6_2() -> None:
         t_hace_4_horas_ms = int((time.time() - 14_400) * 1000)
         mock_ex = _MockExchangeHuerfanas(t_antiguo_ms=t_hace_4_horas_ms)
         procesadas = await gestor_mod.gestor.reconciliar_posiciones_exchange(mock_ex)
-
-        assert procesadas == 3, f"Debieron reconciliarse 3 posiciones huérfanas, procesadas: {procesadas}"
-        assert len(mock_ex.ordenes_cerradas) == 3, "Las 3 posiciones zombies debieron liquidarse a mercado"
+        assert procesadas == 3
+        assert len(mock_ex.ordenes_cerradas) == 3
         print(
-            "✅ [7/8] Auto-Reconciliación de arranque validada: 3 posiciones zombies (ADA, ENA, XRP) "
-            "detectadas y liquidadas con reduceOnly=True."
+            "✅ [7/10] Auto-Reconciliación de arranque validada: 3 posiciones zombies (ADA, ENA, XRP) "
+            "liquidadas con reduceOnly=True."
         )
 
-        # 8. Prueba de Disparo Zero-REST en Ruta Crítica + Fire-and-Forget Telegram
+        # 8. Prueba de Detector de Contagio Cross-Asset (>= 3 pares en 10s), Evacuación Macro y Cooldown 300s
+        gestor_mod.gestor.registrar_cooldown_post_cierre("WAL/USDT:USDT", 300)
+        assert sniper.en_cooldown_post_cierre("WAL/USDT:USDT") is True
+        assert gestor_mod.gestor.segundos_cooldown_restantes("WAL/USDT:USDT") > 290
+        gestor_mod.gestor.cooldown_hasta.clear()
+
+        radar.bloqueo_btc_hasta = 0.0
+        radar._timestamps_panico.clear()
+        t_now = time.time()
+        assert radar.registrar_y_verificar_contagio(mock_ex, "ENA/USDT:USDT", t_now) is False
+        assert radar.registrar_y_verificar_contagio(mock_ex, "NEAR/USDT:USDT", t_now + 1.0) is False
+        assert radar.registrar_y_verificar_contagio(mock_ex, "ADA/USDT:USDT", t_now + 2.0) is True
+        assert radar.bloqueo_activo() is True
+        radar.bloqueo_btc_hasta = 0.0
+        radar._timestamps_panico.clear()
+        print(
+            "✅ [8/10] Detector de Contagio Cross-Asset (>= 3 pares en 10s) y Cooldown Post-Cierre (300s) validados."
+        )
+
+        # 9. Prueba de Cotización Penny-Jump (Bertrand Discreto) y Filtro de Lote Mínimo
         mock_zero = _MockExchangeZeroRest()
+        # Spread = 0.0502 - 0.0499 = 0.0003 (3 ticks) y OFI = +0.40 >= +0.25 -> Debe cotizar en 0.0500 (bid + 1 tick)
+        ticker_penny = {"last": 0.0501, "bid": 0.0499, "ask": 0.0502}
+        p_penny = sniper._extraer_precio_maker_ws(mock_zero, "BTW/USDT:USDT", ticker_penny, ofi=0.40)
+        assert p_penny is not None and abs(p_penny - 0.0500) < 1e-9, f"Esperado Penny-Jump 0.0500, obtenido {p_penny}"
+        print(f"✅ [9/10] Cotización Penny-Jump validada: bid=0.0499, ask=0.0502, OFI=+0.40 -> quote={p_penny:.4f}.")
+
+        # 10. Prueba de Disparo Zero-REST en Ruta Crítica + Fire-and-Forget Telegram
         mock_zero.create_order_en_ruta_critica = True
-        sniper._saldo_libre_ram = 12.7007
+        sniper._saldo_libre_ram = 11.2365
         sniper._saldo_ts = time.time()
         sniper._apalancamiento_ok.add("BTW/USDT:USDT")
         ticker_ws_mock = {"last": 0.0500, "bid": 0.0499, "bidVolume": 50000, "askVolume": 25000}
@@ -299,15 +328,14 @@ async def ejecutar_auditoria_v6_2() -> None:
         await sniper.ejecutar_orden_sniper(
             mock_zero, "BTW/USDT:USDT", z_score=-3.58, ofi=0.33, ticker=ticker_ws_mock
         )
-        assert len(mock_zero.ordenes_creadas) == 1, "La orden Zero-REST debió enviarse en 0 llamadas previas"
-        assert sniper._saldo_libre_ram < 12.7007, "El saldo en RAM debió descontar el margen comprometido"
-        # Limpiar tareas background generadas en el test
+        assert len(mock_zero.ordenes_creadas) == 1
+        assert sniper._saldo_libre_ram < 11.2365
         for t in list(sniper._tareas_as) + list(sniper._tareas_bg):
             t.cancel()
         await asyncio.gather(*sniper._tareas_as, *sniper._tareas_bg, return_exceptions=True)
         sniper._en_vuelo.discard("BTW/USDT:USDT")
         print(
-            "✅ [8/8] Disparo Zero-REST validado: 0 llamadas HTTP previas a create_order, "
+            "✅ [10/10] Disparo Zero-REST validado: 0 llamadas HTTP previas a create_order, "
             "deducción atómica de margen en RAM y despacho Fire-and-Forget verificados."
         )
     finally:
@@ -316,13 +344,14 @@ async def ejecutar_auditoria_v6_2() -> None:
         stats_mod.tracker._trades = trades_originales
         gestor_mod.enviar_alerta = alerta_original_gestor
         sniper.enviar_alerta = alerta_original_sniper
+        gestor_mod.gestor.cooldown_hasta.clear()
         if ruta_temp.exists():
             ruta_temp.unlink()
 
     print("==================================================================")
-    print("🏆 TODAS LAS PRUEBAS DE INTEGRIDAD (8/8) SUPERADAS SIN ERRORES")
+    print("🏆 TODAS LAS PRUEBAS DE INTEGRIDAD V6.3.0 (10/10) SUPERADAS")
     print("==================================================================")
 
 
 if __name__ == "__main__":
-    asyncio.run(ejecutar_auditoria_v6_2())
+    asyncio.run(ejecutar_auditoria_v6_3())

@@ -1,4 +1,7 @@
-"""PositionManager SPLITBRAIN V6.2.2: Auto-Reconciliación de Huérfanas, Anti-Zombie y Resiliencia."""
+"""PositionManager SPLITBRAIN V6.3.0:
+Auto-Reconciliación de Huérfanas, Evacuación Macro Instantánea (BTC Crash / Contagio Cross-Asset),
+Cuarentena Post-Cierre Anti-Knife-Catching (300s), Micro-Break-Even (+0.48%) y Sync Zero-REST.
+"""
 import asyncio
 import importlib
 import time
@@ -39,16 +42,42 @@ class Posicion:
     t_ult_sync: float = 0.0
     t_ult_check: float = 0.0
     t_reintento: float = 0.0
+    ultimo_bid: float = 0.0
+    muestras_q: int = 0
+    suma_nocional_abs: float = 0.0
     extra: dict = field(default_factory=dict)
 
 
 class PositionManager:
     def __init__(self) -> None:
         self.posiciones: dict[str, Posicion] = {}
+        self.cooldown_hasta: dict[str, float] = {}
         self._tareas: set[asyncio.Task] = set()
 
     def tiene(self, symbol: str) -> bool:
         return symbol in self.posiciones
+
+    def registrar_cooldown_post_cierre(self, symbol: str, duracion_seg: Optional[float] = None) -> None:
+        """V6.3.0 Grim Trigger Cooldown:
+        Bloquea nuevas entradas en `symbol` durante COOLDOWN_POST_CIERRE_SEG (300s)
+        contados estrictamente desde el instante en que se cierra la posición.
+        """
+        cd = float(duracion_seg if duracion_seg is not None else getattr(cfg, "COOLDOWN_POST_CIERRE_SEG", 300))
+        if cd > 0:
+            self.cooldown_hasta[symbol] = time.time() + cd
+
+    def en_cooldown(self, symbol: str) -> bool:
+        expira = self.cooldown_hasta.get(symbol, 0.0)
+        if expira <= 0.0:
+            return False
+        if time.time() < expira:
+            return True
+        self.cooldown_hasta.pop(symbol, None)
+        return False
+
+    def segundos_cooldown_restantes(self, symbol: str) -> float:
+        expira = self.cooldown_hasta.get(symbol, 0.0)
+        return max(0.0, expira - time.time())
 
     def abrir(
         self,
@@ -69,11 +98,12 @@ class PositionManager:
             entrada=entrada,
             z_entrada=z_entrada,
             ofi_entrada=ofi_entrada,
-            sl=entrada * (1 - cfg.SL_INICIAL_PCT),
-            sl_exchange=entrada * (1 - cfg.SL_PCT),
+            sl=entrada * (1.0 - cfg.SL_INICIAL_PCT),
+            sl_exchange=entrada * (1.0 - cfg.SL_PCT),
             max_precio=entrada,
             t_apertura=t_inicio,
             ofi_media=media_movil(cfg.OFI_SALIDA_VENTANA_SEG),
+            ultimo_bid=entrada,
         )
         pos.t_ult_check = time.time()
         self.posiciones[symbol] = pos
@@ -87,6 +117,33 @@ class PositionManager:
             f"SL interno {pos.sl:.6g} | SL Bybit {pos.sl_exchange:.6g}"
         )
         return pos
+
+    async def evacuar_por_emergencia_macro(self, exchange, motivo_macro: str = "MACRO_CRASH") -> int:
+        """V6.3.0 Neutralización Instantánea de Beta en Crash Macro / Contagio:
+        Recorre todas las posiciones abiertas en el milisegundo en que colapsa BTC o salta el
+        Breadth Contagion Breaker:
+        - Si la posición está en pérdida o aún no aseguró ganancia neta, la cierra a mercado de inmediato.
+        - Si la posición está en ganancia holgada (> BE_OFFSET_PCT), ciñe su SL interno al bid actual
+          o la liquida para impedir que el contagio borre el beneficio.
+        """
+        activas = list(self.posiciones.values())
+        if not activas:
+            return 0
+        evacuadas = 0
+        print(
+            f"🚨 [EVACUACIÓN MACRO] Ejecutando protocolo `{motivo_macro}` sobre "
+            f"{len(activas)} posición(es) abierta(s)..."
+        )
+        for pos in activas:
+            if pos.cerrando:
+                continue
+            precio_ref = pos.ultimo_bid if pos.ultimo_bid > 0 else pos.entrada
+            try:
+                if await self.cerrar(exchange, pos, f"EVACUACION_{motivo_macro}", precio_ref):
+                    evacuadas += 1
+            except Exception as e:
+                print(f"[EVACUACIÓN MACRO] Error evacuando {pos.symbol}: {type(e).__name__}: {e}")
+        return evacuadas
 
     async def reconciliar_posiciones_exchange(self, exchange) -> int:
         """Audita Bybit al arrancar: adopta posiciones vivas o liquida zombies que excedan TIEMPO_MAX_HOLD_SEG."""
@@ -116,7 +173,6 @@ class PositionManager:
             if entrada <= 0:
                 continue
 
-            # Extraer timestamp de última modificación de la posición en Bybit (ms -> s)
             updated_ms = float(info.get("updatedTime") or info.get("createdTime") or p.get("timestamp") or 0.0)
             t_apertura_real = (updated_ms / 1000.0) if updated_ms > 1e9 else (ahora - cfg.TIEMPO_MAX_HOLD_SEG - 1.0)
             edad_seg = max(0.0, ahora - t_apertura_real)
@@ -136,11 +192,12 @@ class PositionManager:
                     entrada=entrada,
                     z_entrada=None,
                     ofi_entrada=None,
-                    sl=entrada * (1 - cfg.SL_INICIAL_PCT),
-                    sl_exchange=entrada * (1 - cfg.SL_PCT),
+                    sl=entrada * (1.0 - cfg.SL_INICIAL_PCT),
+                    sl_exchange=entrada * (1.0 - cfg.SL_PCT),
                     max_precio=max(entrada, precio_marca),
                     t_apertura=t_apertura_real,
                     ofi_media=media_movil(cfg.OFI_SALIDA_VENTANA_SEG),
+                    ultimo_bid=precio_marca,
                 )
                 await self.cerrar(exchange, pos_temp, "ESCAPE_HUERFANA_BOOT", precio_marca)
             else:
@@ -186,34 +243,38 @@ class PositionManager:
             self.posiciones.pop(pos.symbol, None)
 
     async def _evaluar(self, exchange, pos: Posicion, ticker: dict) -> bool:
-        """Evalúa las condiciones de salida en sub-milisegundos. Devuelve True si se cerró."""
+        """Evalúa las condiciones de salida de Triple Barrera en sub-milisegundos."""
         ahora = time.time()
         bid = ticker.get("bid") or ticker.get("last")
         if not bid or bid <= 0:
             return False
         bid = float(bid)
+        pos.ultimo_bid = bid
+        pos.muestras_q += 1
+        pos.suma_nocional_abs += pos.cantidad * bid
+
         media_ofi = pos.ofi_media.push(ahora, calcular_ofi(ticker))
-        pnl = bid / pos.entrada - 1
+        pnl = bid / pos.entrada - 1.0
         pos.max_precio = max(pos.max_precio, bid)
         tiempo_hold = ahora - pos.t_apertura
 
-        # 1. Break-even: +1.0% → Asegura entrada + 0.15% (cubre comisiones)
+        # 1. Micro-Break-Even V6.3.0: +0.48% -> Asegura entrada + 0.12% (elimina el Valle de la Muerte)
         if not pos.be_activo and pnl >= cfg.BE_ACTIVACION_PCT:
             pos.be_activo = True
-            pos.sl = max(pos.sl, pos.entrada * (1 + cfg.BE_OFFSET_PCT))
-            print(f"[FRANCOTIRADOR] 🛡️ {pos.symbol} Break-even armado: SL {pos.sl:.6g} (PnL {pnl:+.2%})")
+            pos.sl = max(pos.sl, pos.entrada * (1.0 + cfg.BE_OFFSET_PCT))
+            print(f"[FRANCOTIRADOR] 🛡️ {pos.symbol} Micro-Break-Even armado: SL {pos.sl:.6g} (PnL {pnl:+.2%})")
 
-        # 2. Trailing Stop: +1.5% → Rastrear el máximo a distancia de 0.8%
+        # 2. Trailing Stop Ágil V6.3.0: +0.80% -> Rastrear el máximo a distancia de 0.35%
         if not pos.trailing_activo and pnl >= cfg.TRAIL_ACTIVACION_PCT:
             pos.trailing_activo = True
             print(f"[FRANCOTIRADOR] 🧲 {pos.symbol} Trailing Stop activado (PnL {pnl:+.2%})")
         if pos.trailing_activo:
-            pos.sl = max(pos.sl, pos.max_precio * (1 - cfg.TRAIL_DISTANCIA_PCT))
+            pos.sl = max(pos.sl, pos.max_precio * (1.0 - cfg.TRAIL_DISTANCIA_PCT))
 
         # 3. Disparadores deterministas de salida
         motivo = None
 
-        # A) Liquidación forzada anti-zombie por expiración de tiempo
+        # A) Liquidación forzada anti-zombie por expiración de tiempo (300s)
         if tiempo_hold >= cfg.TIEMPO_MAX_HOLD_SEG:
             motivo = "ESCAPE_TEMPORAL"
             print(
@@ -232,7 +293,7 @@ class PositionManager:
                 f"⚠️ [MICROESTRUCTURA] {pos.symbol} flujo TÓXICO masivo (OFI {cfg.OFI_SALIDA_VENTANA_SEG}s "
                 f"{media_ofi:+.2f}): salida de emergencia"
             )
-        # C) Ejecución por Stop-Loss interno, Break-Even o Trailing
+        # C) Ejecución por Stop-Loss interno, Micro-Break-Even o Trailing
         elif bid <= pos.sl:
             motivo = "TRAILING" if pos.trailing_activo else "BREAK_EVEN" if pos.be_activo else "SL"
 
@@ -240,7 +301,7 @@ class PositionManager:
             return await self.cerrar(exchange, pos, motivo, bid)
 
         # 4. Sincronizar SL en Bybit de forma asíncrona hacia arriba
-        objetivo = pos.sl * (1 - MARGEN_SL_EXCHANGE)
+        objetivo = pos.sl * (1.0 - MARGEN_SL_EXCHANGE)
         if (
             (pos.be_activo or pos.trailing_activo)
             and objetivo > pos.sl_exchange
@@ -346,8 +407,18 @@ class PositionManager:
         self, exchange, pos: Posicion, motivo: str, salida: float, cantidad: float
     ) -> None:
         try:
+            # 1. Activar cuarentena post-cierre de 300s (salvo en limpieza de boot heredado)
+            if motivo != "ESCAPE_HUERFANA_BOOT":
+                self.registrar_cooldown_post_cierre(pos.symbol)
+
             pnl_pct, pnl_usdt, fees = _stats.calcular_pnl(pos.entrada, float(salida), float(cantidad))
-            hold = time.time() - pos.t_apertura
+            hold = max(0.1, time.time() - pos.t_apertura)
+            map_usdt = (
+                pos.suma_nocional_abs / pos.muestras_q
+                if pos.muestras_q > 0
+                else (pos.entrada * float(cantidad))
+            )
+
             await _stats.tracker.registrar({
                 "symbol": pos.symbol,
                 "side": "long",
@@ -361,12 +432,18 @@ class PositionManager:
                 "motivo": motivo,
                 "hold_seg": round(hold, 1),
                 "fees_usdt": fees,
+                "map_usdt": round(map_usdt, 4),
             })
+
             icono = "🟩" if pnl_usdt > 0 else "🔴"
             print(
                 f"[FRANCOTIRADOR] {icono} CIERRE {pos.symbol} [{motivo}] {pos.entrada} → {salida} | "
                 f"{pnl_pct:+.2f} % ({pnl_usdt:+.4f} USDT) en {hold:.0f}s"
             )
+
+            # 2. Sincronizar saldo libre en RAM inmediatamente y despachar alerta sin bloquear
+            sniper_mod = importlib.import_module("3_ejecutor_sniper")
+            sniper_mod.disparar_sincronizacion_saldo_bg(exchange)
             await enviar_alerta(
                 f"{icono} [CIERRE {motivo}] {pos.symbol}\n{pnl_pct:+.2f} % ({pnl_usdt:+.4f} USDT) en {hold:.0f}s"
             )
