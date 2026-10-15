@@ -1,4 +1,4 @@
-import os
+﻿import os
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -29,7 +29,7 @@ Z_MAX_ABS = 50.0
 # ==============================================================================
 KELLY_MAX_PCT = 0.35
 APALANCAMIENTO = 3
-CAPITAL_BASE_USDT = 11.2365       # Sincronizado con certificación real Bybit UTA
+CAPITAL_BASE_USDT = 11.8976       # Conciliado al centavo con Real Bybit UTA (Trade #83)
 MIN_INVERSION_USDT = 2.0          # Margen mínimo por disparo
 MAX_MIN_QTY_KELLY_RATIO = 0.60    # V6.3.0: Excluye pares cuyo min_qty*price > 60% del nocional Kelly (BTW, ZEC)
 PENNY_JUMP_OFI_MIN = 0.25         # V6.3.0: Adelanta best_bid + 1 tick si spread >= 2 ticks y OFI >= +0.25
