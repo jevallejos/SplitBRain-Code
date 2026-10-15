@@ -1,6 +1,6 @@
-"""Caja Negra SPLITBRAIN V6.3.0:
-Registro JSONL asíncrono, métricas institucionales MAP (Mean Absolute Position),
-ratio PnL-to-MAP y estimación de LVR (Loss-Versus-Rebalancing).
+"""Caja Negra SPLITBRAIN V6.4.0:
+Registro JSONL asíncrono con Desduplicación Automática de Registros Fantasma,
+Reconciliación Exacta de Capital Base con Bybit UTA y métricas MAP / PnL-to-MAP / LVR.
 """
 import asyncio
 import json
@@ -31,11 +31,38 @@ def calcular_pnl(
 
 
 def estimar_lvr_operacion(nocional_usdt: float, hold_seg: float, sigma_seg: Optional[float] = None) -> float:
-    """Milionis et al. (2022) Loss-Versus-Rebalancing instantáneo integrado:
-        LVR = (sigma^2 / 8) * V(P) * dt
-    """
+    """Milionis et al. (2022) Loss-Versus-Rebalancing instantáneo integrado: LVR = (sigma^2 / 8) * V(P) * dt."""
     sigma = float(sigma_seg if sigma_seg is not None else getattr(cfg, "STD_REL_FLOOR", 0.0005))
     return round((sigma ** 2) / 8.0 * max(0.0, float(nocional_usdt)) * max(0.0, float(hold_seg)), 6)
+
+
+def _parse_ts_epoch(ts_str: Any) -> float:
+    if not ts_str or not isinstance(ts_str, str):
+        return 0.0
+    try:
+        return datetime.fromisoformat(ts_str).timestamp()
+    except Exception:
+        return 0.0
+
+
+def _es_duplicado_fantasma(prev: dict[str, Any], curr: dict[str, Any]) -> bool:
+    """Detecta si dos registros consecutivos corresponden a la misma posición física cerrada (ej. Trade #111/#112)."""
+    if prev.get("symbol") != curr.get("symbol"):
+        return False
+    try:
+        if abs(float(prev.get("entry_price") or 0.0) - float(curr.get("entry_price") or 0.0)) > 1e-9:
+            return False
+        if abs(float(prev.get("exit_price") or 0.0) - float(curr.get("exit_price") or 0.0)) > 1e-9:
+            return False
+        if abs(float(prev.get("qty") or 0.0) - float(curr.get("qty") or 0.0)) > 1e-9:
+            return False
+        t1 = _parse_ts_epoch(prev.get("timestamp"))
+        t2 = _parse_ts_epoch(curr.get("timestamp"))
+        if t1 > 0 and t2 > 0 and abs(t2 - t1) <= 15.0:
+            return True
+    except Exception:
+        return False
+    return False
 
 
 class StatsTracker:
@@ -45,11 +72,12 @@ class StatsTracker:
         self._trades: Optional[list[dict[str, Any]]] = None
         self._lock = asyncio.Lock()
 
-    # ---------- persistencia ----------
+    # ---------- persistencia y desduplicación ----------
     def cargar(self) -> list[dict[str, Any]]:
-        """Lee el histórico (tolerante a líneas corruptas). Se cachea en memoria."""
+        """Lee el histórico JSONL y purga automáticamente cualquier registro duplicado fantasma (ej. #112)."""
         if self._trades is None:
-            trades = []
+            trades: list[dict[str, Any]] = []
+            duplicados_eliminados = 0
             try:
                 with self.ruta.open("r", encoding="utf-8") as f:
                     for linea in f:
@@ -57,22 +85,46 @@ class StatsTracker:
                         if not linea:
                             continue
                         try:
-                            trades.append(json.loads(linea))
+                            reg = json.loads(linea)
+                            if trades and _es_duplicado_fantasma(trades[-1], reg):
+                                duplicados_eliminados += 1
+                                continue
+                            trades.append(reg)
                         except json.JSONDecodeError:
                             print(f"[CAJA NEGRA] Línea corrupta ignorada en {self.ruta.name}")
             except FileNotFoundError:
                 pass
             except Exception as e:
                 print(f"[CAJA NEGRA] No se pudo leer {self.ruta.name}: {type(e).__name__}: {e}")
+
             self._trades = trades
+            if duplicados_eliminados > 0:
+                try:
+                    with self.ruta.open("w", encoding="utf-8") as f:
+                        for r in trades:
+                            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+                    print(
+                        f"🧹 [CAJA NEGRA] Auditoría JSONL eliminó {duplicados_eliminados} "
+                        f"registro(s) duplicado(s) fantasma en {self.ruta.name}."
+                    )
+                except Exception:
+                    pass
         return self._trades
+
+    def sincronizar_capital_base_con_real(self, balance_real: Optional[float]) -> None:
+        """Alinea `capital_base` con `balance_real - pnl_total_usdt` al arrancar sin posiciones abiertas."""
+        if balance_real is None or not math.isfinite(balance_real) or balance_real <= 0:
+            return
+        r = self.resumen()
+        self.capital_base = round(float(balance_real) - float(r["pnl_total_usdt"]), 4)
+        cfg.CAPITAL_BASE_USDT = self.capital_base
 
     def _append(self, linea: str) -> None:
         with self.ruta.open("a", encoding="utf-8") as f:
             f.write(linea + "\n")
 
     async def registrar(self, trade: dict[str, Any]) -> None:
-        """Añade un trade cerrado. La E/S de disco va a un hilo: nunca bloquea el event loop."""
+        """Añade un trade cerrado verificando que no sea un duplicado consecutivo."""
         nocional = float(trade.get("entry_price") or 0.0) * float(trade.get("qty") or 0.0)
         hold_s = float(trade.get("hold_seg") or 0.0)
         lvr_est = estimar_lvr_operacion(nocional, hold_s)
@@ -85,6 +137,9 @@ class StatsTracker:
             linea = json.dumps(registro, ensure_ascii=False)
             async with self._lock:
                 self.cargar()
+                if self._trades and _es_duplicado_fantasma(self._trades[-1], registro):
+                    print(f"[CAJA NEGRA] Registro duplicado bloqueado para {registro.get('symbol')}.")
+                    return
                 await asyncio.to_thread(self._append, linea)
                 self._trades.append(registro)
         except Exception as e:
@@ -139,7 +194,7 @@ class StatsTracker:
             f" MAP: {r['map_usdt']:.2f} USDT | PnL/MAP: {r['pnl_to_map']:+.4f} | LVR: {r['lvr_total_usdt']:.4f}",
             f" Balance: {r['balance_teorico']:.4f} USDT (base {self.capital_base:.2f})   real: {real}",
         ]
-        cab = " [CAJA NEGRA] SPLITBRAIN V6.3.0 APEX PREDATOR "
+        cab = " [CAJA NEGRA] SPLITBRAIN V6.4.0 APEX PREDATOR "
         out = ["╔" + cab.center(ancho, "═") + "╗"]
         out += ["║" + l.ljust(ancho)[:ancho] + "║" for l in lineas]
         out.append("╚" + "═" * ancho + "╝")

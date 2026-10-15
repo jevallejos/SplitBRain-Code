@@ -1,6 +1,6 @@
-"""Ejecutor Sniper SPLITBRAIN V6.3.0:
-Zero-REST Critical Path, Cotización Discreta de Bertrand (Penny-Jump Best-Bid + 1 Tick),
-Warm-Socket Keep-Alive para Tokio (asia-northeast1) y Ecuación HJB Real de Avellaneda-Stoikov.
+"""Ejecutor Sniper SPLITBRAIN V6.4.0:
+Zero-REST Critical Path, Verificación Atómica Anti-Contagio dentro de Lock,
+Cotización Discreta de Bertrand (Penny-Jump Best-Bid + 1 Tick) y Warm-Socket Keep-Alive.
 """
 import asyncio
 import importlib
@@ -18,13 +18,11 @@ _stats = importlib.import_module("6_stats_tracker")
 
 MIN_INVERSION_USDT = getattr(cfg, "MIN_INVERSION_USDT", 2.0)
 
-# Tiempos de espera y ciclo de salida (V6.3.0: espera reducida de 30s a 10s)
 ESPERA_LLENADO_SEG = getattr(cfg, "ESPERA_LLENADO_SEG", 10)
 INTERVALO_AS_SEG = 2
 _tareas_as: set[asyncio.Task] = set()
 _tareas_bg: set[asyncio.Task] = set()
 
-# Estado de vuelo y caché O(1) en RAM
 _en_vuelo: set[str] = set()
 _apalancamiento_ok: set[str] = set()
 _lock_disparo = asyncio.Lock()
@@ -73,10 +71,7 @@ def disparar_sincronizacion_saldo_bg(exchange) -> None:
 
 
 async def bucle_keepalive_socket(exchange) -> None:
-    """V6.3.0 Warm-Socket Keep-Alive:
-    Refresca periódicamente la sesión HTTP/TLS privada y el caché `_saldo_libre_ram` cada 45s
-    cuando no hay órdenes en vuelo, eliminando el handshake TCP+TLS en frío (~150-300ms) en Tokio.
-    """
+    """Warm-Socket Keep-Alive: refresca la sesión HTTP/TLS privada y el caché `_saldo_libre_ram` cada 45s."""
     intervalo = float(getattr(cfg, "KEEPALIVE_SOCKET_SEG", 45.0))
     while True:
         await asyncio.sleep(intervalo)
@@ -157,7 +152,7 @@ async def _fijar_apalancamiento(exchange, symbol: str) -> None:
     try:
         await exchange.set_leverage(cfg.APALANCAMIENTO, symbol)
     except Exception as e:
-        if "110043" not in str(e):  # 110043 = "leverage not modified"
+        if "110043" not in str(e):
             raise
     _apalancamiento_ok.add(symbol)
 
@@ -165,13 +160,7 @@ async def _fijar_apalancamiento(exchange, symbol: str) -> None:
 def _extraer_precio_maker_ws(
     exchange, symbol: str, ticker_ws: Optional[dict], ofi: Optional[float] = None
 ) -> Optional[float]:
-    """V6.3.0 Cotización Discreta de Bertrand (Best-Bid & Penny-Jump):
-    - Si `ask` y `bid` están presentes en el stream WebSocket y el spread es >= 2 ticks
-      con OFI >= PENNY_JUMP_OFI_MIN (+0.25), cotiza en `best_bid + 1 tick` para encabezar la cola
-      de prioridad manteniendo 100% la garantía PostOnly (`best_bid + tick < best_ask`).
-    - Si `ask` está presente pero el spread es de 1 tick, cotiza en `best_bid`.
-    - Si `ask` no está presente (ej. mocks de prueba unitaria), usa `min(last, bid)` por seguridad.
-    """
+    """Cotización Discreta de Bertrand (Best-Bid & Penny-Jump)."""
     t = ticker_ws
     if not t and hasattr(exchange, "tickers") and isinstance(exchange.tickers, dict):
         t = exchange.tickers.get(symbol)
@@ -227,8 +216,19 @@ async def ejecutar_orden_sniper(
         print(f"[FRANCOTIRADOR] {symbol} no disparable (lista negra, posición activa o cooldown post-cierre).")
         return
 
+    radar_mod = importlib.import_module("1_radar_volatilidad")
+    if radar_mod.bloqueo_activo():
+        print(f"[BLOQUEO] Circuit breaker activo antes de lock: disparo abortado ({symbol})")
+        return
+
     async with _lock_disparo:
-        if symbol in cfg.BLACKLIST_PAIRS or posicion_activa(symbol) or en_cooldown_post_cierre(symbol):
+        # V6.4.0: Re-verificación atómica dentro del lock (cierra la carrera de las 17:17:39 UTC)
+        if (
+            symbol in cfg.BLACKLIST_PAIRS
+            or posicion_activa(symbol)
+            or en_cooldown_post_cierre(symbol)
+            or radar_mod.bloqueo_activo()
+        ):
             return
 
         t_disparo_ns = time.perf_counter_ns()
@@ -315,7 +315,7 @@ async def ejecutar_orden_sniper(
 
 
 async def _entregar_al_gestor(exchange, symbol: str, id_compra: str, price: str, z_score: float, ofi: Optional[float]):
-    """Espera el llenado real de la compra (máx 10s en V6.3.0) y entrega la posición al PositionManager."""
+    """Espera el llenado real de la compra (máx 10s) y entrega la posición al PositionManager."""
     try:
         llenado, medio = await _esperar_llenado_detalle(exchange, symbol, id_compra)
         if llenado <= 0:
@@ -388,23 +388,16 @@ def calcular_precio_salida_hjb_as(
     t_restante: float,
     t_total: float,
 ) -> float:
-    """Ecuación HJB de Avellaneda-Stoikov (2008) para liquidación pasiva de inventario:
-        r(s, q, t) = s - q * gamma * sigma^2 * (T - t)
-        delta_ask  = r(s, q, t) - s + (1 / gamma) * ln(1 + gamma / k)
-    Combina el precio de reserva dinámico sobre el mid-price actual `s_mid` con una rampa
-    superior acotada por `entry * (1 + TP_PCT)` en t=0 que converge hacia `r(s, q, t)`.
-    """
+    """Ecuación HJB de Avellaneda-Stoikov (2008) para liquidación pasiva de inventario."""
     gamma = float(getattr(cfg, "GAMMA_AS", 0.05))
     kappa = float(getattr(cfg, "KAPPA_AS", 1.5))
     tau = max(0.0, min(1.0, t_restante / max(t_total, 1.0)))
     sigma_eff = max(float(sigma_rel), getattr(cfg, "STD_REL_FLOOR", 0.0005))
 
-    # Precio de reserva relativo según ecuación HJB de Avellaneda-Stoikov
     reserva_as = s_mid * (1.0 - q_norm * gamma * (sigma_eff ** 2) * max(t_restante, 0.0))
     spread_optimo_rel = min(0.0045, (1.0 / max(gamma, 1e-4)) * math.log(1.0 + gamma / max(kappa, 1e-4)) * 1e-3)
     ask_hjb = reserva_as * (1.0 + spread_optimo_rel)
 
-    # Interpolación suave entre el objetivo inicial y la superficie HJB de reserva
     techo_dinamico = entry * (1.0 + cfg.TP_PCT * tau)
     return min(techo_dinamico, max(ask_hjb, entry * (1.0 + cfg.BE_OFFSET_PCT)))
 

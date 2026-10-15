@@ -1,7 +1,7 @@
-"""Radar de Volatilidad y Microestructura SPLITBRAIN V6.3.1:
-Incluye Ancla Macro EMA de 15 minutos en O(1) (Anti-Pump-Top), Filtro de Absorción Compradora
-Estricta (OFI >= +0.05), Detector de Contagio Cross-Asset (>= 3 pares en 10s), Evacuación Activa
-Macro y Verificación de Cuarentena Post-Cierre (300s).
+"""Radar de Volatilidad y Microestructura SPLITBRAIN V6.4.0:
+Incluye Campo Potencial de Lyapunov (Atractor vs Repulsor), Cont OFI + VPIN en O(1),
+Compuerta de Fricción de Macrì (Spread <= 12 bps), Techo de Volatilidad P99, Ancla EMA900,
+Detector de Contagio Cross-Asset y Reconexión WebSocket en 50ms.
 """
 import asyncio
 import importlib
@@ -29,8 +29,20 @@ _timestamps_panico: dict[str, float] = {}
 
 
 class VentanaZ:
-    """Z-Score rodante O(1) con Ancla Macro EMA de 15 min (900s) para vetar compras en Pump-Tops."""
-    __slots__ = ("buf", "n", "s", "s2", "cnt", "ema_lenta", "alpha_ema")
+    """Z-Score rodante O(1) con Ancla Macro EMA900, Aceleración de Lyapunov y VPIN ligero."""
+    __slots__ = (
+        "buf",
+        "n",
+        "s",
+        "s2",
+        "cnt",
+        "ema_lenta",
+        "alpha_ema",
+        "ult_r",
+        "acel_lyapunov",
+        "vol_compra_ema",
+        "vol_venta_ema",
+    )
 
     def __init__(self, n: int = VENTANA, ventana_ema: int | None = None) -> None:
         self.buf: deque[float] = deque(maxlen=n)
@@ -38,11 +50,17 @@ class VentanaZ:
         v_ema = int(ventana_ema or getattr(cfg, "EMA_MACRO_VENTANA_SEG", 900))
         self.alpha_ema: float = 2.0 / (max(v_ema, 2) + 1.0)
         self.ema_lenta: float | None = None
+        self.ult_r: float = 0.0
+        self.acel_lyapunov: float = 0.0
+        self.vol_compra_ema: float = 1.0
+        self.vol_venta_ema: float = 1.0
 
     def reset(self) -> None:
         """Limpia la ventana corta de 60s pero CONSERVA `ema_lenta` para no perder la memoria macro de 15m."""
         self.buf.clear()
         self.s = self.s2 = 0.0
+        self.ult_r = 0.0
+        self.acel_lyapunov = 0.0
 
     def cambio_relativo(self) -> float:
         """Retorno relativo entre el inicio y el final de la ventana de 60 s."""
@@ -58,7 +76,7 @@ class VentanaZ:
         return (self.buf[-1] - max_p) / max_p if max_p > 0 else 0.0
 
     def desviacion_ema_macro(self) -> float:
-        """V6.3.1: Distancia relativa del precio actual respecto a la EMA macro de 15 minutos."""
+        """Distancia relativa del precio actual respecto a la EMA macro de 15 minutos."""
         if not self.buf or self.ema_lenta is None or self.ema_lenta <= 0:
             return 0.0
         return (self.buf[-1] - self.ema_lenta) / self.ema_lenta
@@ -73,21 +91,42 @@ class VentanaZ:
         std = max(self.s2 / len(self.buf) - media * media, 0.0) ** 0.5
         return max(std / media, getattr(cfg, "STD_REL_FLOOR", 0.0005))
 
+    def actualizar_flujo_vpin(self, vol_bid: float, vol_ask: float, retorno_inst: float) -> float:
+        """V6.4.0: Estimador recursivo O(1) de toxicidad VPIN sincronizado con desbalance L1."""
+        peso_b = max(0.0, float(vol_bid)) * (1.2 if retorno_inst >= 0 else 0.8)
+        peso_s = max(0.0, float(vol_ask)) * (1.2 if retorno_inst < 0 else 0.8)
+        self.vol_compra_ema = 0.85 * self.vol_compra_ema + 0.15 * peso_b
+        self.vol_venta_ema = 0.85 * self.vol_venta_ema + 0.15 * peso_s
+        total = self.vol_compra_ema + self.vol_venta_ema
+        if total <= 1e-9:
+            return 0.0
+        # Toxicidad direccional vendedora en [0, 1]
+        return max(0.0, (self.vol_venta_ema - self.vol_compra_ema) / total)
+
     def push(self, x: float) -> float | None:
         if x is None or not math.isfinite(x) or x <= 0:
             return None
+        x_f = float(x)
         if self.ema_lenta is None:
-            self.ema_lenta = float(x)
+            self.ema_lenta = x_f
         else:
-            self.ema_lenta = (1.0 - self.alpha_ema) * self.ema_lenta + self.alpha_ema * float(x)
+            self.ema_lenta = (1.0 - self.alpha_ema) * self.ema_lenta + self.alpha_ema * x_f
+
+        if self.buf and self.buf[-1] > 0:
+            r_actual = math.log(x_f / self.buf[-1])
+            self.acel_lyapunov = r_actual - self.ult_r
+            self.ult_r = r_actual
+        else:
+            self.ult_r = 0.0
+            self.acel_lyapunov = 0.0
 
         if len(self.buf) == self.n:
             viejo = self.buf[0]
             self.s -= viejo
             self.s2 -= viejo * viejo
-        self.buf.append(x)
-        self.s += x
-        self.s2 += x * x
+        self.buf.append(x_f)
+        self.s += x_f
+        self.s2 += x_f * x_f
         self.cnt += 1
         if self.cnt % 10_000 == 0:
             self.s = sum(self.buf)
@@ -100,7 +139,7 @@ class VentanaZ:
             return 0.0
         piso_rel = abs(media) * getattr(cfg, "STD_REL_FLOOR", 0.0)
         std = max(std, piso_rel, cfg.STD_MIN)
-        return (x - media) / std
+        return (x_f - media) / std
 
 
 def es_glitch(z: float | None) -> bool:
@@ -138,6 +177,15 @@ def calcular_ofi(ticker: dict) -> float:
     vol_bid = ticker.get("bidVolume") or 0
     vol_ask = ticker.get("askVolume") or 0
     return (vol_bid - vol_ask) / (vol_bid + vol_ask) if (vol_bid + vol_ask) > 0 else 0.0
+
+
+def calcular_spread_relativo(ticker: dict) -> float:
+    """V6.4.0: Calcula (ask - bid) / bid en O(1) para la Compuerta de Fricción de Macrì."""
+    bid = ticker.get("bid")
+    ask = ticker.get("ask")
+    if bid is not None and ask is not None and bid > 0 and ask >= bid:
+        return float((ask - bid) / bid)
+    return 0.0
 
 
 def bloqueo_activo() -> bool:
@@ -223,8 +271,9 @@ async def cazar_cisne_negro(exchange) -> None:
                 bloqueo_btc_hasta = ahora + cfg.BLOQUEO_BTC_SEG
         except asyncio.CancelledError:
             raise
-        except Exception:
-            await asyncio.sleep(1)
+        except Exception as e:
+            espera_err = 0.05 if "RequestTimeout" in type(e).__name__ or "keepalive" in str(e).lower() else 1.0
+            await asyncio.sleep(espera_err)
 
 
 async def cazar_anomalia_ws(exchange, symbol: str) -> None:
@@ -258,8 +307,16 @@ async def cazar_anomalia_ws(exchange, symbol: str) -> None:
             if z_actual is None:
                 continue
 
+            vpin_toxico = ventana.actualizar_flujo_vpin(
+                ticker.get("bidVolume") or 0.0,
+                ticker.get("askVolume") or 0.0,
+                ventana.ult_r,
+            )
             caida_rel = ventana.caida_desde_maximo()
             desv_ema_macro = ventana.desviacion_ema_macro()
+            sigma_rel = ventana.volatilidad_relativa()
+            spread_rel = calcular_spread_relativo(ticker)
+
             _escudo.centinela.actualizar_telemetria(
                 symbol, z_actual, ofi, precio_actual, ventana.cambio_relativo()
             )
@@ -289,7 +346,7 @@ async def cazar_anomalia_ws(exchange, symbol: str) -> None:
                 )
                 continue
 
-            # 4. V6.3.1 Anti-Pump-Top: Veta compras si el precio sigue sobreextendido sobre la EMA de 15 min
+            # 4. Anti-Pump-Top: Veta compras si el precio sigue sobreextendido sobre la EMA de 15 min
             if desv_ema_macro > cfg.TECHO_MACRO_EMA_PCT:
                 print(
                     f"⚠️ [ANTI-PUMP-TOP] {symbol} sobreextendido sobre EMA900 "
@@ -297,9 +354,36 @@ async def cazar_anomalia_ws(exchange, symbol: str) -> None:
                 )
                 continue
 
-            # 5. V6.3.1 Absorción Compradora Estricta: Exige OFI >= +0.05 en el instante del disparo
-            if ofi < cfg.UMBRAL_OFI_TOXICO:
-                print(f"⚠️ [MICROESTRUCTURA] Flujo TÓXICO/DÉBIL. Abortando. ({symbol} OFI={ofi:.2f} < {cfg.UMBRAL_OFI_TOXICO:+.2f})")
+            # 5. V6.4.0 Compuerta de Fricción de Macrì: Veta libros ilíquidos con spread > 12 bps
+            if spread_rel > cfg.MAX_SPREAD_REL_ENTRADA:
+                print(
+                    f"⚠️ [FRICCIÓN SPREAD] {symbol} spread excesivo "
+                    f"({spread_rel:.2%} > {cfg.MAX_SPREAD_REL_ENTRADA:.2%}). Disparo abortado."
+                )
+                continue
+
+            # 6. V6.4.0 Techo de Volatilidad P99 (GJR-GARCH Tail-Risk Protection)
+            if sigma_rel > cfg.VOL_MAX_P99_REL:
+                print(
+                    f"⚠️ [TAIL-RISK P99] {symbol} volatilidad extrema LVR "
+                    f"(sigma={sigma_rel:.2%} > {cfg.VOL_MAX_P99_REL:.2%}). Disparo abortado."
+                )
+                continue
+
+            # 7. V6.4.0 Campo Potencial de Lyapunov: Veta si el cuchillo sigue acelerando hacia abajo (Repulsor)
+            if ventana.acel_lyapunov < cfg.LYAPUNOV_ACCEL_MIN and ofi < 0.70:
+                print(
+                    f"⚠️ [REPULSOR LYAPUNOV] {symbol} caída acelerando "
+                    f"(a={ventana.acel_lyapunov:+.4%} < {cfg.LYAPUNOV_ACCEL_MIN:+.4%}). Esperando frenado."
+                )
+                continue
+
+            # 8. Absorción Compradora Estricta y VPIN: Exige OFI >= +0.08 y VPIN <= 0.72
+            if ofi < cfg.UMBRAL_OFI_TOXICO or vpin_toxico > cfg.VPIN_MAX_TOXICO:
+                print(
+                    f"⚠️ [MICROESTRUCTURA] Flujo TÓXICO/DÉBIL. Abortando. "
+                    f"({symbol} OFI={ofi:.2f} < {cfg.UMBRAL_OFI_TOXICO:+.2f} | VPIN={vpin_toxico:.2f})"
+                )
                 continue
             if _sniper.posicion_activa(symbol):
                 continue
@@ -327,7 +411,7 @@ async def cazar_anomalia_ws(exchange, symbol: str) -> None:
                         z_actual,
                         ofi,
                         ticker=ticker,
-                        sigma_rel=ventana.volatilidad_relativa(),
+                        sigma_rel=sigma_rel,
                     )
 
             await asyncio.sleep(COOLDOWN_S)
@@ -335,5 +419,7 @@ async def cazar_anomalia_ws(exchange, symbol: str) -> None:
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            print(f"[RADAR] Error en {symbol}: {type(e).__name__}: {e}")
-            await asyncio.sleep(1)
+            es_timeout_ws = "RequestTimeout" in type(e).__name__ or "keepalive" in str(e).lower()
+            if not es_timeout_ws:
+                print(f"[RADAR] Error en {symbol}: {type(e).__name__}: {e}")
+            await asyncio.sleep(0.05 if es_timeout_ws else 1.0)

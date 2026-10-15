@@ -1,4 +1,4 @@
-"""Cerebro Central SPLIT-BRAIN HFT (V6.3.1 Anti-Pump-Top & Positive-OFI - Tokio asia-northeast1)."""
+"""Cerebro Central SPLIT-BRAIN HFT (V6.4.0 Zero-Zombie & Maker-First Unwind - Tokio asia-northeast1)."""
 import asyncio
 import importlib
 import os
@@ -7,7 +7,6 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-# Activación nativa de uvloop (libuv en C) en Linux antes de instanciar el bucle de eventos
 if sys.platform != "win32":
     try:
         import uvloop
@@ -24,7 +23,6 @@ LOCK_FILE = _RAIZ / ".splitbrain.lock"
 _lock_file_handle = None
 _lock_adquirido_por_mi: bool = False
 
-# Zona horaria de Chile Continental (UTC-3) y UTC+0 (Bybit Exchange Time)
 _TZ_CHILE = timezone(timedelta(hours=-3))
 
 
@@ -149,7 +147,6 @@ class _TeeLogger:
         return getattr(self._stream, name)
 
 
-# Sanitización de consola contra problemas de encoding en entornos heredados
 for _s in (sys.stdout, sys.stderr):
     try:
         _s.reconfigure(encoding="utf-8", errors="replace")
@@ -174,9 +171,7 @@ RECV_WINDOW_MS = 15000
 
 
 def _es_perpetuo_cripto_puro(exchange, symbol: str) -> bool:
-    """V6.3.1: Filtra perpetuos lineales USDT activos Tier-1, excluyendo listas negras,
-    activos sintéticos y (si PERMITIR_ZONA_INNOVATION=False) tokens de zona 'innovation'.
-    """
+    """Filtra perpetuos lineales USDT activos Tier-1, excluyendo listas negras y zona 'innovation'."""
     if not symbol.endswith("USDT:USDT"):
         return False
     if symbol in cfg.PROHIBIDAS or symbol in cfg.BLACKLIST_PAIRS:
@@ -193,10 +188,7 @@ def _es_perpetuo_cripto_puro(exchange, symbol: str) -> bool:
 
 
 def _es_lote_minimo_viable(exchange, symbol: str, ticker: dict, nocional_kelly_base: float) -> bool:
-    """V6.3.0+ Filtro de Viabilidad de Lote Mínimo:
-    Descarta pares cuyo lote mínimo (`min_qty * last` o `step * last`) supere el
-    `MAX_MIN_QTY_KELLY_RATIO` (60%) del nocional Kelly base (ej. SOL, BTW, ZEC).
-    """
+    """Descarta pares cuyo lote mínimo supere el MAX_MIN_QTY_KELLY_RATIO (60%) del nocional Kelly base."""
     m = exchange.markets.get(symbol)
     if not m:
         return False
@@ -260,16 +252,21 @@ async def main():
     adquirir_bloqueo_instancia_unica()
     loop_name = type(asyncio.get_running_loop()).__name__
     print("==================================================================")
-    print("INICIANDO CEREBRO CENTRAL SPLIT-BRAIN HFT (V6.3.1 - ANTI-PUMP-TOP)")
+    print("INICIANDO CEREBRO CENTRAL SPLIT-BRAIN HFT (V6.4.0 - ZERO-ZOMBIE)")
     print("==================================================================")
     print(f"[MAIN] Bloqueo de instancia física adquirido exitosamente (PID {os.getpid()} | Loop: {loop_name}).")
     print(f"[MAIN] Telemetría local con sellado de tiempo activa en: {LOG_FILE.name}")
 
+    # V6.4.0: Configuración nativa `streaming` de ccxt.pro para erradicar ping-pong RequestTimeout
     exchange = ccxt.bybit({
         "apiKey": cfg.BYBIT_API_KEY,
         "secret": cfg.BYBIT_API_SECRET,
         "timeout": TIMEOUT_EXCHANGE_MS,
         "enableRateLimit": True,
+        "streaming": {
+            "keepAlive": cfg.WS_KEEPALIVE_MS,
+            "maxPingPongMisses": cfg.WS_MAX_PING_MISSES,
+        },
         "options": {
             "defaultType": "swap",
             "recvWindow": RECV_WINDOW_MS,
@@ -284,7 +281,8 @@ async def main():
     try:
         tickers = await _inicializar_mercados_con_backoff(exchange)
 
-        # 0. Reconciliar posiciones huérfanas y auditar margen ANTES de elegir las 15 presas
+        # 0. Desduplicar JSONL, reconciliar huérfanas y auditar margen ANTES de elegir las 15 presas
+        stats.tracker.cargar()
         await gestor_mod.gestor.reconciliar_posiciones_exchange(exchange)
         nocional_kelly_base = await _auditar_margen_libre(exchange)
 
@@ -307,23 +305,27 @@ async def main():
 
         if excluidos_lote:
             print(
-                f"[MAIN] Filtro de lote mínimo V6.3.1 excluyó pares indivisibles: "
+                f"[MAIN] Filtro de lote mínimo V6.4.0 excluyó pares indivisibles: "
                 f"{', '.join(excluidos_lote[:6])}"
             )
 
         print(
-            f"[MAIN] Modo Paper: {cfg.MODO_PAPER} | Motor Salida: {cfg.MOTOR_SALIDA} | "
-            f"OFI Min: {cfg.UMBRAL_OFI_TOXICO:+.2f} | Techo EMA900: +{cfg.TECHO_MACRO_EMA_PCT:.2%} | "
-            f"BE: +{cfg.BE_ACTIVACION_PCT:.2%} (Piso Ex: +{cfg.BE_PISO_EXCHANGE_PCT:.2%}) | "
-            f"Trail: +{cfg.TRAIL_ACTIVACION_PCT:.2%}"
+            f"[MAIN] Modo Paper: {cfg.MODO_PAPER} | Motor Salida: {cfg.MOTOR_SALIDA}+MAKER_PFQI | "
+            f"OFI Min: {cfg.UMBRAL_OFI_TOXICO:+.2f} | Hold Máx: {cfg.TIEMPO_MAX_HOLD_SEG}s "
+            f"(Cortes: {cfg.EARLY_TOXIC_HOLD_SEG}s/{cfg.STAGNATION_HOLD_SEG}s) | "
+            f"BE: +{cfg.BE_ACTIVACION_PCT:.2%} | Trail: +{cfg.TRAIL_ACTIVACION_PCT:.2%}"
         )
         print(f"[MAIN] Radar fijado en {len(presas)} pares cripto-nativos Tier-1 viables.")
         print(f"[MAIN] Presas activas: {', '.join(presas)}")
 
         await sniper.precalentar_apalancamiento_universo(exchange, presas)
         escudo.centinela.inicializar_universo(presas)
-        stats.tracker.imprimir_dashboard(await stats.leer_balance_real(exchange))
-        sniper.enviar_alerta_bg("🟩 Motor SPLITBRAIN V6.3.1 (Anti-Pump-Top & Positive-OFI) Inicializado.")
+
+        bal_real_init = await stats.leer_balance_real(exchange)
+        if not gestor_mod.gestor.posiciones and bal_real_init is not None:
+            stats.tracker.sincronizar_capital_base_con_real(bal_real_init)
+        stats.tracker.imprimir_dashboard(bal_real_init)
+        sniper.enviar_alerta_bg("🟩 Motor SPLITBRAIN V6.4.0 (Zero-Zombie & Maker-First Unwind) Inicializado.")
 
         # 1. Tarea de Circuit Breaker Global BTC con Evacuación Activa
         tareas.append(asyncio.create_task(radar.cazar_cisne_negro(exchange)))
