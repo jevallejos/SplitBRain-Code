@@ -18,9 +18,9 @@ BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET")
 MODO_PAPER = False  # Modo Producción Real en Bybit UTA
 TOP_N = 15
 UMBRAL_PANICO = -2.6
-UMBRAL_OFI_TOXICO = -0.5
+UMBRAL_OFI_TOXICO = -0.35  # V6.2.4: Filtra libros con > 2.08x presión vendedora
 STD_MIN = 1e-8
-STD_REL_FLOOR = 0.0005  # Piso de volatilidad relativa (0.05% del precio)
+STD_REL_FLOOR = 0.0005     # Piso de volatilidad relativa (0.05% del precio)
 Z_MAX_ABS = 50.0
 
 # ==============================================================================
@@ -32,7 +32,7 @@ CAPITAL_BASE_USDT = 13.18
 MIN_INVERSION_USDT = 2.0  # Margen mínimo por disparo
 
 # ==============================================================================
-# 4. GESTIÓN DINÁMICA DE SALIDAS (V6.2.3 ANTI-ZOMBIE + COMPATIBILIDAD SNIPER)
+# 4. GESTIÓN DINÁMICA DE SALIDAS (V6.2.4 ANTI-ZOMBIE + COMPATIBILIDAD SNIPER)
 # ==============================================================================
 MOTOR_SALIDA = "TRAILING"  # "TRAILING" (PositionManager) | "AS" (Avellaneda-Stoikov)
 
@@ -40,7 +40,7 @@ MOTOR_SALIDA = "TRAILING"  # "TRAILING" (PositionManager) | "AS" (Avellaneda-Sto
 TIEMPO_MAX_HOLD_SEG = 300  # 5 minutos máximos de retención (Anti-Zombie)
 
 # Parámetros de Take-Profit / Stop-Loss de referencia y emergencia
-TP_PCT = 0.05                 # Referencia de Take-Profit requerida por 3_ejecutor_sniper.py (+5.0%)
+TP_PCT = 0.05                 # Referencia de Take-Profit (+5.0%)
 SL_PCT = 0.03                 # SL de catástrofe adjunto en Bybit (-3.0%)
 SL_INICIAL_PCT = 0.025        # SL interno inicial (-2.5%)
 BE_ACTIVACION_PCT = 0.010     # PnL ≥ +1.0% → SL a break-even
