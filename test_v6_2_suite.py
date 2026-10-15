@@ -24,7 +24,7 @@ def _extraer_atributos_cfg_ast(raiz: Path) -> Set[Tuple[str, str]]:
     """Escanea el AST de todos los módulos y extrae cada acceso `cfg.<ATRIBUTO>`."""
     requeridos: Set[Tuple[str, str]] = set()
     for nombre_archivo in ARCHIVOS_PROYECTO:
-        codigo = (raiz / nombre_archivo).read_text(encoding="utf-8")
+        codigo = (raiz / nombre_archivo).read_text(encoding="utf-8-sig")
         arbol = ast.parse(codigo, filename=nombre_archivo)
         for nodo in ast.walk(arbol):
             if isinstance(nodo, ast.Attribute) and isinstance(nodo.value, ast.Name) and nodo.value.id == "cfg":
@@ -245,7 +245,7 @@ async def ejecutar_auditoria_v6_3() -> None:
     main_mod.adquirir_bloqueo_instancia_unica()
     assert main_mod.LOCK_FILE.exists()
     assert main_mod._lock_adquirido_por_mi is True
-    segundo_handle = main_mod.LOCK_FILE.open("a+", encoding="utf-8")
+    segundo_handle = main_mod.LOCK_FILE.open("a+", encoding="utf-8-sig")
     bloqueado_correctamente = False
     try:
         if sys.platform != "win32":
