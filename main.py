@@ -1,4 +1,4 @@
-"""Cerebro Central SPLIT-BRAIN HFT (V6.3.0 Anti-Contagio - Tokio asia-northeast1 + uvloop)."""
+"""Cerebro Central SPLIT-BRAIN HFT (V6.3.1 Anti-Pump-Top & Positive-OFI - Tokio asia-northeast1)."""
 import asyncio
 import importlib
 import os
@@ -174,7 +174,9 @@ RECV_WINDOW_MS = 15000
 
 
 def _es_perpetuo_cripto_puro(exchange, symbol: str) -> bool:
-    """Filtra perpetuos lineales USDT activos, excluyendo listas negras y sintéticos."""
+    """V6.3.1: Filtra perpetuos lineales USDT activos Tier-1, excluyendo listas negras,
+    activos sintéticos y (si PERMITIR_ZONA_INNOVATION=False) tokens de zona 'innovation'.
+    """
     if not symbol.endswith("USDT:USDT"):
         return False
     if symbol in cfg.PROHIBIDAS or symbol in cfg.BLACKLIST_PAIRS:
@@ -184,15 +186,16 @@ def _es_perpetuo_cripto_puro(exchange, symbol: str) -> bool:
         return False
     info = m.get("info") or {}
     symbol_type = str(info.get("symbolType") or "").strip().lower()
-    if symbol_type and symbol_type not in ("", "innovation"):
+    tipos_permitidos = ("", "innovation") if cfg.PERMITIR_ZONA_INNOVATION else ("",)
+    if symbol_type not in tipos_permitidos:
         return False
     return True
 
 
 def _es_lote_minimo_viable(exchange, symbol: str, ticker: dict, nocional_kelly_base: float) -> bool:
-    """V6.3.0 Filtro de Viabilidad de Lote Mínimo:
+    """V6.3.0+ Filtro de Viabilidad de Lote Mínimo:
     Descarta pares cuyo lote mínimo (`min_qty * last` o `step * last`) supere el
-    `MAX_MIN_QTY_KELLY_RATIO` (60%) del nocional Kelly base (ej. BTW ~$23.6, ZEC ~$11.0).
+    `MAX_MIN_QTY_KELLY_RATIO` (60%) del nocional Kelly base (ej. SOL, BTW, ZEC).
     """
     m = exchange.markets.get(symbol)
     if not m:
@@ -257,7 +260,7 @@ async def main():
     adquirir_bloqueo_instancia_unica()
     loop_name = type(asyncio.get_running_loop()).__name__
     print("==================================================================")
-    print("INICIANDO CEREBRO CENTRAL SPLIT-BRAIN HFT (V6.3.0 - ANTI-CONTAGIO)")
+    print("INICIANDO CEREBRO CENTRAL SPLIT-BRAIN HFT (V6.3.1 - ANTI-PUMP-TOP)")
     print("==================================================================")
     print(f"[MAIN] Bloqueo de instancia física adquirido exitosamente (PID {os.getpid()} | Loop: {loop_name}).")
     print(f"[MAIN] Telemetría local con sellado de tiempo activa en: {LOG_FILE.name}")
@@ -271,6 +274,9 @@ async def main():
             "defaultType": "swap",
             "recvWindow": RECV_WINDOW_MS,
             "adjustForTimeDifference": True,
+            "ws": {
+                "keepAlive": cfg.WS_KEEPALIVE_MS,
+            },
         },
     })
 
@@ -301,22 +307,23 @@ async def main():
 
         if excluidos_lote:
             print(
-                f"[MAIN] Filtro de lote mínimo V6.3.0 excluyó pares indivisibles: "
+                f"[MAIN] Filtro de lote mínimo V6.3.1 excluyó pares indivisibles: "
                 f"{', '.join(excluidos_lote[:6])}"
             )
 
         print(
             f"[MAIN] Modo Paper: {cfg.MODO_PAPER} | Motor Salida: {cfg.MOTOR_SALIDA} | "
-            f"Máx Hold: {cfg.TIEMPO_MAX_HOLD_SEG}s | Cooldown Post-Cierre: {cfg.COOLDOWN_POST_CIERRE_SEG}s | "
-            f"BE: +{cfg.BE_ACTIVACION_PCT:.2%} | Trail: +{cfg.TRAIL_ACTIVACION_PCT:.2%}"
+            f"OFI Min: {cfg.UMBRAL_OFI_TOXICO:+.2f} | Techo EMA900: +{cfg.TECHO_MACRO_EMA_PCT:.2%} | "
+            f"BE: +{cfg.BE_ACTIVACION_PCT:.2%} (Piso Ex: +{cfg.BE_PISO_EXCHANGE_PCT:.2%}) | "
+            f"Trail: +{cfg.TRAIL_ACTIVACION_PCT:.2%}"
         )
-        print(f"[MAIN] Radar fijado en {len(presas)} pares cripto-nativos viables.")
+        print(f"[MAIN] Radar fijado en {len(presas)} pares cripto-nativos Tier-1 viables.")
         print(f"[MAIN] Presas activas: {', '.join(presas)}")
 
         await sniper.precalentar_apalancamiento_universo(exchange, presas)
         escudo.centinela.inicializar_universo(presas)
         stats.tracker.imprimir_dashboard(await stats.leer_balance_real(exchange))
-        sniper.enviar_alerta_bg("🟩 Motor SPLITBRAIN V6.3.0 (Anti-Contagio + Tokio HFT) Inicializado.")
+        sniper.enviar_alerta_bg("🟩 Motor SPLITBRAIN V6.3.1 (Anti-Pump-Top & Positive-OFI) Inicializado.")
 
         # 1. Tarea de Circuit Breaker Global BTC con Evacuación Activa
         tareas.append(asyncio.create_task(radar.cazar_cisne_negro(exchange)))

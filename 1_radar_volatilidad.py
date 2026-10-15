@@ -1,6 +1,7 @@
-"""Radar de Volatilidad y Microestructura SPLITBRAIN V6.3.0:
-Incluye Detector de Contagio Cross-Asset (>= 3 pares en 10s), Evacuación Activa Macro,
-Filtro de Magnitud Mínima de Caída y Verificación de Cuarentena Post-Cierre.
+"""Radar de Volatilidad y Microestructura SPLITBRAIN V6.3.1:
+Incluye Ancla Macro EMA de 15 minutos en O(1) (Anti-Pump-Top), Filtro de Absorción Compradora
+Estricta (OFI >= +0.05), Detector de Contagio Cross-Asset (>= 3 pares en 10s), Evacuación Activa
+Macro y Verificación de Cuarentena Post-Cierre (300s).
 """
 import asyncio
 import importlib
@@ -28,14 +29,18 @@ _timestamps_panico: dict[str, float] = {}
 
 
 class VentanaZ:
-    """Z-Score rodante O(1): sumas acumuladas con piso relativo anti-ruido en mercados planos."""
-    __slots__ = ("buf", "n", "s", "s2", "cnt")
+    """Z-Score rodante O(1) con Ancla Macro EMA de 15 min (900s) para vetar compras en Pump-Tops."""
+    __slots__ = ("buf", "n", "s", "s2", "cnt", "ema_lenta", "alpha_ema")
 
-    def __init__(self, n: int = VENTANA) -> None:
+    def __init__(self, n: int = VENTANA, ventana_ema: int | None = None) -> None:
         self.buf: deque[float] = deque(maxlen=n)
         self.n, self.s, self.s2, self.cnt = n, 0.0, 0.0, 0
+        v_ema = int(ventana_ema or getattr(cfg, "EMA_MACRO_VENTANA_SEG", 900))
+        self.alpha_ema: float = 2.0 / (max(v_ema, 2) + 1.0)
+        self.ema_lenta: float | None = None
 
     def reset(self) -> None:
+        """Limpia la ventana corta de 60s pero CONSERVA `ema_lenta` para no perder la memoria macro de 15m."""
         self.buf.clear()
         self.s = self.s2 = 0.0
 
@@ -52,6 +57,12 @@ class VentanaZ:
         max_p = max(self.buf)
         return (self.buf[-1] - max_p) / max_p if max_p > 0 else 0.0
 
+    def desviacion_ema_macro(self) -> float:
+        """V6.3.1: Distancia relativa del precio actual respecto a la EMA macro de 15 minutos."""
+        if not self.buf or self.ema_lenta is None or self.ema_lenta <= 0:
+            return 0.0
+        return (self.buf[-1] - self.ema_lenta) / self.ema_lenta
+
     def volatilidad_relativa(self) -> float:
         """Desviación estándar relativa (sigma / media) de la ventana actual en O(1)."""
         if len(self.buf) < 2:
@@ -65,6 +76,11 @@ class VentanaZ:
     def push(self, x: float) -> float | None:
         if x is None or not math.isfinite(x) or x <= 0:
             return None
+        if self.ema_lenta is None:
+            self.ema_lenta = float(x)
+        else:
+            self.ema_lenta = (1.0 - self.alpha_ema) * self.ema_lenta + self.alpha_ema * float(x)
+
         if len(self.buf) == self.n:
             viejo = self.buf[0]
             self.s -= viejo
@@ -129,7 +145,7 @@ def bloqueo_activo() -> bool:
 
 
 def registrar_y_verificar_contagio(exchange, symbol: str, ahora: float) -> bool:
-    """V6.3.0 Breadth Contagion Breaker:
+    """V6.3.0+ Breadth Contagion Breaker:
     Registra el timestamp de pánico del símbolo y purga eventos antiguos (> CONTAGIO_VENTANA_SEG).
     Si >= CONTAGIO_MIN_PARES entran en pánico dentro de la ventana móvil, activa el bloqueo global
     y ordena la evacuación inmediata de las posiciones abiertas en PositionManager.
@@ -243,6 +259,7 @@ async def cazar_anomalia_ws(exchange, symbol: str) -> None:
                 continue
 
             caida_rel = ventana.caida_desde_maximo()
+            desv_ema_macro = ventana.desviacion_ema_macro()
             _escudo.centinela.actualizar_telemetria(
                 symbol, z_actual, ofi, precio_actual, ventana.cambio_relativo()
             )
@@ -250,11 +267,11 @@ async def cazar_anomalia_ws(exchange, symbol: str) -> None:
             if z_actual > cfg.UMBRAL_PANICO:
                 continue
 
-            # V6.3.0: Exigir magnitud mínima de caída real desde el máximo de la ventana de 60s
+            # 1. Exigir magnitud mínima de caída real desde el máximo de la ventana de 60s
             if caida_rel > cfg.CAIDA_MIN_PCT:
                 continue
 
-            # V6.3.0: Registrar pánico y verificar contagio sistémico cross-asset (>= 3 pares en 10s)
+            # 2. Registrar pánico y verificar contagio sistémico cross-asset (>= 3 pares en 10s)
             if registrar_y_verificar_contagio(exchange, symbol, ahora):
                 print(f"[BLOQUEO] Contagio simultáneo activo: anomalía ignorada ({symbol})")
                 continue
@@ -263,7 +280,7 @@ async def cazar_anomalia_ws(exchange, symbol: str) -> None:
                 print(f"[BLOQUEO] Anomalía ignorada ({symbol})")
                 continue
 
-            # V6.3.0: Cuarentena post-cierre de 300s (Erradicación del Serial Knife-Catching)
+            # 3. Cuarentena post-cierre de 300s (Erradicación del Serial Knife-Catching)
             if _sniper.en_cooldown_post_cierre(symbol):
                 restante_cd = _gestor_mod.gestor.segundos_cooldown_restantes(symbol)
                 print(
@@ -272,8 +289,17 @@ async def cazar_anomalia_ws(exchange, symbol: str) -> None:
                 )
                 continue
 
+            # 4. V6.3.1 Anti-Pump-Top: Veta compras si el precio sigue sobreextendido sobre la EMA de 15 min
+            if desv_ema_macro > cfg.TECHO_MACRO_EMA_PCT:
+                print(
+                    f"⚠️ [ANTI-PUMP-TOP] {symbol} sobreextendido sobre EMA900 "
+                    f"({desv_ema_macro:+.2%} > +{cfg.TECHO_MACRO_EMA_PCT:.2%}). Disparo abortado."
+                )
+                continue
+
+            # 5. V6.3.1 Absorción Compradora Estricta: Exige OFI >= +0.05 en el instante del disparo
             if ofi < cfg.UMBRAL_OFI_TOXICO:
-                print(f"⚠️ [MICROESTRUCTURA] Flujo TÓXICO. Abortando. ({symbol} OFI={ofi:.2f})")
+                print(f"⚠️ [MICROESTRUCTURA] Flujo TÓXICO/DÉBIL. Abortando. ({symbol} OFI={ofi:.2f} < {cfg.UMBRAL_OFI_TOXICO:+.2f})")
                 continue
             if _sniper.posicion_activa(symbol):
                 continue
@@ -281,8 +307,8 @@ async def cazar_anomalia_ws(exchange, symbol: str) -> None:
             aprobado_ram = await evaluar_anomalia_groq(symbol)
             lat_us = (time.perf_counter_ns() - t_inicio_ns) / 1000.0
             print(
-                f"[RADAR] {symbol} Z={z_actual:.2f} ({caida_rel:.2%}) OFI={ofi:.2f} -> ESCUDO RAM O(1): "
-                f"{'APROBADO' if aprobado_ram else 'VETADO'} ({lat_us:.1f} µs)"
+                f"[RADAR] {symbol} Z={z_actual:.2f} ({caida_rel:.2%} | EMA900 {desv_ema_macro:+.2%}) "
+                f"OFI={ofi:+.2f} -> ESCUDO RAM O(1): {'APROBADO' if aprobado_ram else 'VETADO'} ({lat_us:.1f} µs)"
             )
 
             if aprobado_ram:

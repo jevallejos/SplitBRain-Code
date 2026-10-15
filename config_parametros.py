@@ -13,66 +13,71 @@ BYBIT_API_KEY = os.getenv("BYBIT_API_KEY")
 BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET")
 
 # ==============================================================================
-# 2. CONFIGURACIÓN BASE DE MERCADO Y RADAR DE MICROESTRUCTURA (V6.3.0)
+# 2. CONFIGURACIÓN BASE DE MERCADO Y RADAR DE MICROESTRUCTURA (V6.3.1)
 # ==============================================================================
-MODO_PAPER = False          # Modo Producción Real en Bybit UTA (asia-northeast1)
+MODO_PAPER = False                 # Modo Producción Real en Bybit UTA (asia-northeast1)
 TOP_N = 15
 UMBRAL_PANICO = -2.6
-UMBRAL_OFI_TOXICO = -0.35   # V6.2.4+: Filtra libros con > 2.08x presión vendedora
-CAIDA_MIN_PCT = -0.0045     # V6.3.0: Exige caída >= 0.45% desde el máximo de 60s
+UMBRAL_OFI_TOXICO = 0.05           # V6.3.1: Exige absorción compradora neta (V_bid >= 1.105 * V_ask)
+CAIDA_MIN_PCT = -0.0045            # V6.3.0+: Exige caída >= 0.45% desde el máximo de 60s
+EMA_MACRO_VENTANA_SEG = 900        # V6.3.1: Horizonte de 15 min (900s) para ancla macro O(1)
+TECHO_MACRO_EMA_PCT = 0.0080       # V6.3.1: Veta compras si el precio está > +0.80% sobre EMA900 (Anti-Pump-Top)
+PERMITIR_ZONA_INNOVATION = False   # V6.3.1: Excluye tokens de zona 'innovation' (ZEREBRO, PUMPFUN)
 STD_MIN = 1e-8
-STD_REL_FLOOR = 0.0005      # Piso de volatilidad relativa (0.05% del precio)
+STD_REL_FLOOR = 0.0005             # Piso de volatilidad relativa (0.05% del precio)
 Z_MAX_ABS = 50.0
 
 # ==============================================================================
-# 3. GESTIÓN DE CAPITAL, TAMAÑO DE ORDEN Y VIABILIDAD DE LOTE (V6.3.0)
+# 3. GESTIÓN DE CAPITAL, TAMAÑO DE ORDEN Y VIABILIDAD DE LOTE (V6.3.1)
 # ==============================================================================
 KELLY_MAX_PCT = 0.35
 APALANCAMIENTO = 3
-CAPITAL_BASE_USDT = 11.8976       # Conciliado al centavo con Real Bybit UTA (Trade #83)
-MIN_INVERSION_USDT = 2.0          # Margen mínimo por disparo
-MAX_MIN_QTY_KELLY_RATIO = 0.60    # V6.3.0: Excluye pares cuyo min_qty*price > 60% del nocional Kelly (BTW, ZEC)
-PENNY_JUMP_OFI_MIN = 0.25         # V6.3.0: Adelanta best_bid + 1 tick si spread >= 2 ticks y OFI >= +0.25
-ESPERA_LLENADO_SEG = 10           # V6.3.0: Cancela compras no llenadas en 10s para liberar margen rápido
-KEEPALIVE_SOCKET_SEG = 45.0       # V6.3.0: Mantiene caliente el socket TLS privado hacia Bybit
+CAPITAL_BASE_USDT = 11.8976        # V6.3.1: Conciliado al diezmilésimo con Real Bybit UTA (10.8811 - (-1.0165))
+MIN_INVERSION_USDT = 2.0           # Margen mínimo por disparo
+MAX_MIN_QTY_KELLY_RATIO = 0.60     # Excluye pares cuyo min_qty*price > 60% del nocional Kelly (SOL, ZEC, BTW)
+PENNY_JUMP_OFI_MIN = 0.25          # Adelanta best_bid + 1 tick si spread >= 2 ticks y OFI >= +0.25
+ESPERA_LLENADO_SEG = 10            # Cancela compras no llenadas en 10s para liberar margen rápido
+KEEPALIVE_SOCKET_SEG = 45.0        # Mantiene caliente el socket TLS privado hacia Bybit
+WS_KEEPALIVE_MS = 15000            # V6.3.1: Intervalo ping-pong WebSocket para prevenir RequestTimeout
 
 # ==============================================================================
-# 4. GESTIÓN DINÁMICA DE SALIDAS Y FIN DEL "VALLE DE LA MUERTE" (V6.3.0)
+# 4. GESTIÓN DINÁMICA DE SALIDAS Y BLINDAJE DE BREAK-EVEN EN BYBIT (V6.3.1)
 # ==============================================================================
-MOTOR_SALIDA = "TRAILING"   # "TRAILING" (PositionManager) | "AS" (Avellaneda-Stoikov HJB)
+MOTOR_SALIDA = "TRAILING"          # "TRAILING" (PositionManager) | "AS" (Avellaneda-Stoikov HJB)
 
 # Horquilla temporal máxima y cuarentena post-cierre Anti-Knife-Catching
-TIEMPO_MAX_HOLD_SEG = 300         # 5 minutos máximos de retención (Anti-Zombie)
-COOLDOWN_POST_CIERRE_SEG = 300    # V6.3.0: 300s de bloqueo por símbolo medidos desde el CIERRE
+TIEMPO_MAX_HOLD_SEG = 300          # 5 minutos máximos de retención (Anti-Zombie)
+COOLDOWN_POST_CIERRE_SEG = 300     # 300s de bloqueo por símbolo medidos desde el CIERRE
 
-# Parámetros de Triple Barrera Recalibrados (Micro-Break-Even y Trailing Ágil)
-TP_PCT = 0.05                     # Referencia de Take-Profit (+5.0%)
-SL_PCT = 0.03                     # SL de catástrofe adjunto en Bybit (-3.0%)
-SL_INICIAL_PCT = 0.025            # SL interno inicial (-2.5%)
-BE_ACTIVACION_PCT = 0.0048        # V6.3.0: PnL >= +0.48% -> Arma Micro-Break-Even
-BE_OFFSET_PCT = 0.0012            # V6.3.0: Asegura entrada + 0.12% (cubre fees y deja utilidad neta)
-TRAIL_ACTIVACION_PCT = 0.0080     # V6.3.0: PnL >= +0.80% -> Activa Trailing Stop
-TRAIL_DISTANCIA_PCT = 0.0035      # V6.3.0: Distancia de trailing ajustada a 0.35% desde el máximo
-OFI_SALIDA_EMERGENCIA = -0.80     # Salida a mercado si el flujo es tóxico en pérdidas
-OFI_SALIDA_VENTANA_SEG = 10       # Ventana de media móvil OFI para salida de emergencia
-SYNC_SL_EXCHANGE_SEG = 5          # Sincronización de SL dinámico hacia Bybit (segundos)
+# Parámetros de Triple Barrera Recalibrados y Cota Inferior de SL en Exchange
+TP_PCT = 0.05                      # Referencia de Take-Profit (+5.0%)
+SL_PCT = 0.03                      # SL de catástrofe adjunto en Bybit (-3.0%)
+SL_INICIAL_PCT = 0.025             # SL interno inicial (-2.5%)
+BE_ACTIVACION_PCT = 0.0048         # PnL >= +0.48% -> Arma Micro-Break-Even
+BE_OFFSET_PCT = 0.0016             # V6.3.1: Asegura entrada + 0.16% interno (cubre fees Taker y slippage)
+BE_PISO_EXCHANGE_PCT = 0.0010      # V6.3.1: El SL sincronizado en Bybit jamás baja de entrada + 0.10%
+TRAIL_ACTIVACION_PCT = 0.0080      # PnL >= +0.80% -> Activa Trailing Stop
+TRAIL_DISTANCIA_PCT = 0.0035       # Distancia de trailing ajustada a 0.35% desde el máximo
+OFI_SALIDA_EMERGENCIA = -0.80      # Salida a mercado si el flujo es tóxico en pérdidas
+OFI_SALIDA_VENTANA_SEG = 10        # Ventana de media móvil OFI para salida de emergencia
+SYNC_SL_EXCHANGE_SEG = 5           # Sincronización de SL dinámico hacia Bybit (segundos)
 
 # Parámetros Avellaneda-Stoikov HJB Real (AS)
 GAMMA_AS = 0.05
-KAPPA_AS = 1.5                    # Densidad estructural del libro de órdenes k
+KAPPA_AS = 1.5                     # Densidad estructural del libro de órdenes k
 
 # ==============================================================================
-# 5. CIRCUIT BREAKER GLOBAL (BTC + CONTAGIO CROSS-ASSET V6.3.0)
+# 5. CIRCUIT BREAKER GLOBAL (BTC + CONTAGIO CROSS-ASSET)
 # ==============================================================================
 BLOQUEO_BTC_SEG = 300
-CONTAGIO_MIN_PARES = 3            # V6.3.0: >= 3 altcoins en pánico activan bloqueo global y evacuación
-CONTAGIO_VENTANA_SEG = 10.0       # V6.3.0: Ventana móvil de 10s para detección de contagio simultáneo
+CONTAGIO_MIN_PARES = 3             # >= 3 altcoins en pánico activan bloqueo global y evacuación
+CONTAGIO_VENTANA_SEG = 10.0        # Ventana móvil de 10s para detección de contagio simultáneo
 OFI_REANUDACION_BTC = 0.30
 OFI_REANUDACION_VENTANA_SEG = 30
 RECUPERACION_MIN_PCT = 0.50
 
 # ==============================================================================
-# 6. CENTINELA LPU GROQ (MEMORIA RAM LOCK-FREE + ROTACIÓN MULTI-MODELO V6.3.0)
+# 6. CENTINELA LPU GROQ (MEMORIA RAM LOCK-FREE + ROTACIÓN MULTI-MODELO)
 # ==============================================================================
 GROQ_CICLO_SEG = 180
 GROQ_TIMEOUT_SEG = 6.0
