@@ -1,8 +1,10 @@
-"""Cerebro Central SPLIT-BRAIN HFT (V6.2.4 - Zero-REST Sniper + Orphan Reconciler + PID Lock)."""
+"""Cerebro Central SPLIT-BRAIN HFT (V6.2.4 Base Estable - Timestamped Logger + Zero-REST Sniper)."""
 import asyncio
 import importlib
 import os
 import sys
+import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import ccxt.pro as ccxt
@@ -12,6 +14,17 @@ _RAIZ = Path(__file__).resolve().parent
 LOG_FILE = _RAIZ / "bot_hft.log"
 LOCK_FILE = _RAIZ / ".splitbrain.lock"
 _lock_file_handle = None
+
+# Zona horaria de Chile Continental (UTC-3) y UTC+0 (Bybit Exchange Time)
+_TZ_CHILE = timezone(timedelta(hours=-3))
+
+
+def _sello_tiempo() -> str:
+    """Genera el prefijo cronológico exacto con precisión de milisegundos (Chile y UTC)."""
+    ahora_utc = datetime.now(timezone.utc)
+    ahora_cl = ahora_utc.astimezone(_TZ_CHILE)
+    ms = ahora_utc.microsecond // 1000
+    return f"[{ahora_cl.strftime('%Y-%m-%d %H:%M:%S')}.{ms:03d} CL | {ahora_utc.strftime('%H:%M:%S')} UTC] "
 
 
 def adquirir_bloqueo_instancia_unica() -> None:
@@ -60,23 +73,39 @@ def liberar_bloqueo_instancia_unica() -> None:
 
 
 class _TeeLogger:
-    """Duplica la salida estándar hacia bot_hft.log en UTF-8 con vaciado continuo."""
-    __slots__ = ("_stream", "_archivo")
+    """Duplica toda salida (stdout/stderr) hacia bot_hft.log inyectando fecha y hora en cada línea."""
+    __slots__ = ("_stream", "_archivo", "_inicio_linea")
 
     def __init__(self, stream, archivo):
         self._stream = stream
         self._archivo = archivo
+        self._inicio_linea = True
+
+    def _formatear_con_hora(self, data: str) -> str:
+        partes = data.splitlines(keepends=True)
+        if not partes:
+            return data
+        prefijo = _sello_tiempo()
+        salida = []
+        for fragmento in partes:
+            if self._inicio_linea and fragmento not in ("\n", "\r\n", "\r"):
+                salida.append(prefijo + fragmento)
+            else:
+                salida.append(fragmento)
+            self._inicio_linea = fragmento.endswith(("\n", "\r"))
+        return "".join(salida)
 
     def write(self, data: str) -> int:
         if not data:
             return 0
+        texto_sellado = self._formatear_con_hora(data)
         try:
-            self._stream.write(data)
+            self._stream.write(texto_sellado)
             self._stream.flush()
         except Exception:
             pass
         try:
-            self._archivo.write(data)
+            self._archivo.write(texto_sellado)
             self._archivo.flush()
         except Exception:
             pass
@@ -99,6 +128,7 @@ class _TeeLogger:
         return getattr(self._stream, name)
 
 
+# Sanitización de consola contra problemas de encoding en entornos heredados
 for _s in (sys.stdout, sys.stderr):
     try:
         _s.reconfigure(encoding="utf-8", errors="replace")
@@ -167,7 +197,7 @@ async def _auditar_margen_libre(exchange) -> None:
         total = float(usdt.get("total") or 0.0)
         libre = float(usdt.get("free") or 0.0)
         sniper._saldo_libre_ram = libre
-        sniper._saldo_ts = asyncio.get_running_loop().time()
+        sniper._saldo_ts = time.time()
         usado = max(0.0, total - libre)
         margen_disparo = libre * cfg.KELLY_MAX_PCT
         estado = "LISTO PARA DISPARAR" if margen_disparo >= 2.0 else "MUNICIÓN BAJA (< 2.0 USDT)"
@@ -182,10 +212,10 @@ async def _auditar_margen_libre(exchange) -> None:
 async def main():
     adquirir_bloqueo_instancia_unica()
     print("==================================================================")
-    print("INICIANDO CEREBRO CENTRAL SPLIT-BRAIN HFT (V6.2.4 - ZERO-REST SNIPER)")
+    print("INICIANDO CEREBRO CENTRAL SPLIT-BRAIN HFT (V6.2.4 - BASE ESTABLE)")
     print("==================================================================")
     print(f"[MAIN] Bloqueo de instancia física adquirido exitosamente (PID {os.getpid()}).")
-    print(f"[MAIN] Telemetría local persistente activa en: {LOG_FILE.name}")
+    print(f"[MAIN] Telemetría local con sellado de tiempo activa en: {LOG_FILE.name}")
 
     exchange = ccxt.bybit({
         "apiKey": cfg.BYBIT_API_KEY,
@@ -224,7 +254,7 @@ async def main():
 
         escudo.centinela.inicializar_universo(presas)
         stats.tracker.imprimir_dashboard(await stats.leer_balance_real(exchange))
-        sniper.enviar_alerta_bg("🟩 Motor SPLITBRAIN V6.2.4 (Zero-REST Sniper + OFI -0.35) Inicializado.")
+        sniper.enviar_alerta_bg("🟩 Motor SPLITBRAIN V6.2.4 (Base Estable + Timestamped Log) Inicializado.")
 
         # 1. Tarea de Circuit Breaker Global BTC
         tareas.append(asyncio.create_task(radar.cazar_cisne_negro(exchange)))
