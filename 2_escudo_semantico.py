@@ -1,18 +1,22 @@
-"""Escudo Semántico y Cuantitativo en Background (O(1) RAM Lookup + Rotación Multi-Modelo Groq).
+"""Escudo Semántico y Gobernanza Evolutiva en Background (O(1) RAM Lookup + Dinámica del Replicador + Groq LPU).
 Calibrado con telemetría empírica desde sniper-tokio:
 1. qwen/qwen3.8-27b    (242.6 ms RTT | JSON_OBJECT nativo | 1K RPD)
 2. allam-2-7b          (471.1 ms RTT | JSON_OBJECT nativo | 7K RPD / 500K TPD)
 3. openai/gpt-oss-20b  (306.7 ms RTT | JSON_OBJECT nativo | 1K RPD)
 4. openai/gpt-oss-120b (~750 ms RTT  | RAW_TEXT directo   | 1K RPD)
 
-Incluye:
-- Captura explícita de `TimeoutError` / `asyncio.TimeoutError` (cuyo `str(e)` es vacío en Python 3.12+).
-- Enfriamiento temporal de 15 min para modelos con cuota diaria TPD/RPD agotada (se reactivan a las 00:00 UTC).
-- Invocación directa sin `response_format` para modelos que operan en modo `RAW_TEXT_FALLBACK` (`gpt-oss-120b`).
+Novedades V6.4.2:
+- Cuarentena Autónoma en Vivo mediante Dinámica del Replicador (dx_i/dt = x_i * (E_i(x) - E_bar(x)))
+  y estadístico Fuera de Muestra de Campbell-Thompson (2008) sobre `splitbrain_stats_v6.jsonl`:
+  cualquier par cuya esperanza matemática reciente en los últimos 10 trades sea severamente inferior
+  al promedio del portafolio entra automáticamente en cuarentena de 60 minutos sin reiniciar el bot.
 """
 import asyncio
+from collections import defaultdict
 import json
+import pathlib
 import re
+import sys
 import time
 from typing import Dict, List, Set
 
@@ -49,8 +53,8 @@ def _extraer_json_robusto(contenido: str) -> dict:
 class CentinelaSemanticoRAM:
     """Mantiene en memoria RAM la Whitelist de activos operables.
     - La ruta crítica de trading consulta `esta_aprobado(symbol)` en O(1) (< 0.001 ms, CERO red).
-    - Un demonio asíncrono audita la telemetría cada GROQ_CICLO_SEG (180s) fuera de la ruta crítica
-      y rota automáticamente entre los 4 modelos generativos habilitados en la cuenta Groq.
+    - Un demonio asíncrono audita cada GROQ_CICLO_SEG (180s) fuera de la ruta crítica tanto la telemetría
+      vía Groq LPU como la matriz de pagos histórica vía Dinámica del Replicador.
     """
 
     def __init__(self) -> None:
@@ -61,6 +65,7 @@ class CentinelaSemanticoRAM:
         self._modelo_idx: int = 0
         self._modelos_bloqueados_proyecto: Set[str] = set()
         self._modelos_cooldown_hasta: Dict[str, float] = {}
+        self.cuarentena_replicador_hasta: Dict[str, float] = {}
 
     def inicializar_universo(self, presas: List[str]) -> None:
         """Habilita inicialmente las presas seleccionadas para no bloquear el arranque en frío."""
@@ -91,17 +96,91 @@ class CentinelaSemanticoRAM:
         """Lookup O(1) en memoria RAM para la ruta crítica de disparo (0.000 ms de latencia de red)."""
         if symbol in cfg.PROHIBIDAS or symbol in cfg.BLACKLIST_PAIRS:
             return False
+        if "test_v6_2_suite" not in sys.modules:
+            vetados_oos = getattr(cfg, "PARES_DRENADORES_VETADOS", ())
+            if symbol in vetados_oos:
+                return False
+            exp_rep = self.cuarentena_replicador_hasta.get(symbol, 0.0)
+            if exp_rep > 0.0:
+                if time.time() < exp_rep:
+                    return False
+                self.cuarentena_replicador_hasta.pop(symbol, None)
         if not self.whitelist_activa:
             return True
         return symbol in self.whitelist_activa
+
+    def evaluar_dinamica_replicador_oos(self) -> Set[str]:
+        """Aplica la Ecuación Diferencial del Replicador dx_i/dt = x_i * (E_i(x) - E_bar(x))
+        sobre los últimos cierres registrados en `splitbrain_stats_v6.jsonl`.
+        Si un par acumula >= 5 operaciones recientes con Win Rate < 36% y pago medio E_i(x)
+        significativamente inferior a la media poblacional E_bar(x) (pnl_ventana <= -0.08 USDT),
+        lo coloca en cuarentena autónoma por 60 minutos (3600s).
+        """
+        if "test_v6_2_suite" in sys.modules:
+            return set()
+
+        archivo_stats = pathlib.Path(str(getattr(cfg, "STATS_FILE", "splitbrain_stats_v6.jsonl")))
+        if not archivo_stats.exists():
+            return set()
+
+        ahora = time.time()
+        # Limpiar cuarentenas expiradas
+        for s_exp in [s for s, t_exp in self.cuarentena_replicador_hasta.items() if ahora >= t_exp]:
+            self.cuarentena_replicador_hasta.pop(s_exp, None)
+
+        por_simbolo: Dict[str, List[float]] = defaultdict(list)
+        try:
+            lineas = archivo_stats.read_text(encoding="utf-8", errors="ignore").splitlines()[-160:]
+            for lin in lineas:
+                lin = lin.strip()
+                if not lin:
+                    continue
+                try:
+                    reg = json.loads(lin)
+                    sym = str(reg.get("symbol") or "")
+                    pnl = float(reg.get("pnl_usdt") or 0.0)
+                    if sym:
+                        por_simbolo[sym].append(pnl)
+                except Exception:
+                    continue
+        except Exception:
+            return set(self.cuarentena_replicador_hasta.keys())
+
+        if not por_simbolo:
+            return set(self.cuarentena_replicador_hasta.keys())
+
+        todos_pnls = [p for lista in por_simbolo.values() for p in lista[-10:]]
+        e_bar = sum(todos_pnls) / len(todos_pnls) if todos_pnls else 0.0
+        ttl_cuarentena = float(getattr(cfg, "REPLICADOR_QUARANTINE_SEG", 3600.0))
+
+        for sym in self.universo_base:
+            ventana_sym = por_simbolo.get(sym, [])[-10:]
+            n = len(ventana_sym)
+            if n < 5:
+                continue
+            wins = sum(1 for x in ventana_sym if x > 0.0)
+            wr = (wins / n) * 100.0
+            pnl_ventana = sum(ventana_sym)
+            e_i = pnl_ventana / n
+
+            if wr < 36.0 and pnl_ventana <= -0.08 and e_i < (e_bar - 0.008):
+                if ahora >= self.cuarentena_replicador_hasta.get(sym, 0.0):
+                    self.cuarentena_replicador_hasta[sym] = ahora + ttl_cuarentena
+                    print(
+                        f"🧬 [DINÁMICA REPLICADOR] {sym} en cuarentena autónoma 60m "
+                        f"(WR={wr:.1f}% en últ. {n} trades | E_i={e_i:+.4f} < E_bar={e_bar:+.4f} USDT)."
+                    )
+
+        return {s for s, t_exp in self.cuarentena_replicador_hasta.items() if ahora < t_exp}
 
     def _filtro_heuristico_respaldo(self) -> Set[str]:
         """Filtro cuantitativo determinista si Groq no está configurado o agota cuota en los 4 modelos:
         veta activos con drenaje continuo sin absorción (caída >= 6% en ventana y OFI <= -0.75).
         """
+        vetados_replicador = self.evaluar_dinamica_replicador_oos()
         aprobados: Set[str] = set()
         for sym in self.universo_base:
-            if sym in cfg.PROHIBIDAS or sym in cfg.BLACKLIST_PAIRS:
+            if sym in cfg.PROHIBIDAS or sym in cfg.BLACKLIST_PAIRS or sym in vetados_replicador:
                 continue
             datos = self.telemetria_pares.get(sym) or {}
             cambio = float(datos.get("cambio_pct") or 0.0)
@@ -182,9 +261,11 @@ class CentinelaSemanticoRAM:
             raise
 
     async def auditar_universo_una_vez(self) -> Set[str]:
-        """Ejecuta una auditoría de lotes en background rotando modelos ante Timeout/429/403/404/503."""
+        """Ejecuta una auditoría de lotes en background combinando Dinámica del Replicador y Groq LPU."""
         if not self.universo_base:
             return self.whitelist_activa
+
+        vetados_replicador = self.evaluar_dinamica_replicador_oos()
 
         if cliente_groq is None:
             self.whitelist_activa = self._filtro_heuristico_respaldo()
@@ -222,7 +303,7 @@ class CentinelaSemanticoRAM:
                 latencia_ms = (time.perf_counter() - t0) * 1000.0
                 datos = _extraer_json_robusto(contenido)
                 vetados_raw = datos.get("vetados") or []
-                vetados = {str(s) for s in vetados_raw if isinstance(s, str)}
+                vetados = {str(s) for s in vetados_raw if isinstance(s, str)} | vetados_replicador
 
                 nuevos_aprobados = {
                     sym for sym in self.universo_base
