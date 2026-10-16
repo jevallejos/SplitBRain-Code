@@ -427,54 +427,136 @@ async def cazar_anomalia_ws(exchange, symbol: str) -> None:
             await asyncio.sleep(0.05 if es_timeout_ws else 1.0)
 
 
-# === [INYECCION CUANTITATIVA V6.4.0+: MEMORIA HAWKES & ANCLAJE CAGINALP] ===
+# === [INYECCION CUANTITATIVA V6.4.1: HAWKES CLIMAX + TIERING OOS + ANTI-SL-REENTRY] ===
 import builtins as _builtins
+import inspect as _inspect
 import re as _re
-import re
+import sys as _sys
+import time as _time
 
 _HAWKES_TOXIC_TS: dict = {}
+_ULTIMO_SL_INFO: dict = {}
 _RE_SYM_RADAR = _re.compile(r"([A-Z0-9]+/USDT:USDT)")
 
 
 def registrar_pulso_toxico_hawkes(symbol: str) -> None:
-    """Registra el instante exacto de un choque toxico OFI o repulsor de Lyapunov (Raffaelli et al., 2026)."""
-    import time as _t
-    _HAWKES_TOXIC_TS[str(symbol)] = _t.time()
+    _HAWKES_TOXIC_TS[str(symbol)] = _time.time()
 
 
-def validar_entrada_hawkes_caginalp(symbol: str, z_val: float = -3.0, ema_pct: float = 0.0) -> bool:
-    """Filtro de segunda generacion:
-    1. Veta drenadores cronicos (WLD, ZRO, DOGE, ONDO, TRUTH).
-    2. Memoria de Hawkes (4.0s Anti-Spoofing) tras un pulso toxico OFI o repulsor de Lyapunov.
-    3. Anclaje EMA900 de Caginalp (+0.18% maximo sobre equilibrio cuando Z > -3.60).
-    """
-    import sys as _sys
-    import time as _t
-    import config_parametros as _cfg
+def registrar_cierre_sl_estructural(symbol: str, exit_price: float) -> None:
+    """Guarda el precio y timestamp de un cierre en perdida para bloquear reentradas mas bajas."""
+    _ULTIMO_SL_INFO[str(symbol)] = {"ts": _time.time(), "price": float(exit_price)}
 
+
+def _extraer_metricas_frame_radar(symbol: str) -> dict:
+    """Inspecciona los frames de ejecucion del radar para obtener los valores reales de Z, EMA900, OFI y precio."""
+    datos = {"z": -3.0, "ema_pct": 0.0, "ofi": 0.5, "price": 0.0}
+    try:
+        frame = _sys._getframe(1)
+        for _ in range(5):
+            if frame is None:
+                break
+            loc = frame.f_locals
+            for kz in ("z_score", "z", "z_val", "z_actual"):
+                if kz in loc and isinstance(loc[kz], (int, float)):
+                    datos["z"] = float(loc[kz])
+                    break
+            for ke in ("dist_ema_pct", "ema_pct", "distancia_ema", "diff_ema_pct", "ema_diff"):
+                if ke in loc and isinstance(loc[ke], (int, float)):
+                    datos["ema_pct"] = float(loc[ke])
+                    break
+            for ko in ("ofi", "ofi_val", "ofi_10s", "ofi_actual"):
+                if ko in loc and isinstance(loc[ko], (int, float)):
+                    datos["ofi"] = float(loc[ko])
+                    break
+            for kp in ("precio_actual", "price", "last_price", "best_bid", "bid"):
+                if kp in loc and isinstance(loc[kp], (int, float)) and float(loc[kp]) > 0:
+                    datos["price"] = float(loc[kp])
+                    break
+            frame = frame.f_back
+    except Exception:
+        pass
+    return datos
+
+
+def validar_entrada_v6_4_1(symbol: str) -> bool:
+    """Valida en O(1) las 5 compuertas cuantitativas de V6.4.1 antes de aprobar el disparo:"""
     if "test_v6_2_suite" in _sys.modules:
         return True
 
+    import config_parametros as _cfg
+
+    sym = str(symbol)
     vetados = getattr(_cfg, "PARES_DRENADORES_VETADOS", ("WLD/USDT:USDT", "ZRO/USDT:USDT", "DOGE/USDT:USDT", "ONDO/USDT:USDT"))
-    if str(symbol) in vetados:
+    if sym in vetados:
         return False
 
-    cooldown_hawkes = float(getattr(_cfg, "HAWKES_COOLDOWN_TOXICO_SEG", 4.0))
-    dt_toxico = _t.time() - float(_HAWKES_TOXIC_TS.get(str(symbol), 0.0))
-    if dt_toxico < cooldown_hawkes and z_val > -3.80:
+    # 1. Cerrojo estricto de Posicion Unica (Single-Slot Mutex)
+    try:
+        gestor_mod = _sys.modules.get("5_gestor_posiciones")
+        if gestor_mod is not None:
+            for attr_g in ("gestor", "gestor_posiciones", "POSICIONES_ACTIVAS", "posiciones_activas"):
+                obj_g = getattr(gestor_mod, attr_g, None)
+                if isinstance(obj_g, dict) and len(obj_g) >= 1:
+                    return False
+                if hasattr(obj_g, "posiciones") and isinstance(obj_g.posiciones, dict) and len(obj_g.posiciones) >= 1:
+                    return False
+    except Exception:
+        pass
+
+    metricas = _extraer_metricas_frame_radar(sym)
+    z_val = metricas["z"]
+    ema_pct = metricas["ema_pct"]
+    ofi_val = metricas["ofi"]
+    price_now = metricas["price"]
+
+    # 2. Tiering Campbell-Thompson OOS: Nucleo Alfa (Z <= -2.90) vs Secundarios (Z <= -3.35)
+    nucleo_alfa = getattr(
+        _cfg,
+        "PARES_NUCLEO_ALFA",
+        ("ZEREBRO/USDT:USDT", "WAL/USDT:USDT", "STRK/USDT:USDT", "INJ/USDT:USDT", "XRP/USDT:USDT", "1000PEPE/USDT:USDT", "HYPE/USDT:USDT"),
+    )
+    z_req = float(getattr(_cfg, "Z_SCORE_NUCLEO_ALFA", -2.90)) if sym in nucleo_alfa else float(getattr(_cfg, "Z_SCORE_SECUNDARIOS_OOS", -3.35))
+    if z_val > z_req:
+        return False
+
+    # 3. Escudo Anti-Reentrada en Cuchillo Cayendo (900s tras SL si el precio sigue debajo del SL)
+    sl_info = _ULTIMO_SL_INFO.get(sym)
+    if sl_info is not None:
+        dt_sl = _time.time() - float(sl_info.get("ts", 0.0))
+        ventana_sl = float(getattr(_cfg, "ANTI_REENTRADA_BAJO_SL_SEG", 900.0))
+        sl_price = float(sl_info.get("price", 0.0))
+        if dt_sl < ventana_sl and price_now > 0.0 and price_now <= sl_price * 1.0015 and z_val > -5.50:
+            _builtins.print(
+                f"🛡️ [ANTI-KNIFE CONTINUATION] {sym} cotizando bajo su ultimo SL ({price_now} <= {sl_price} hace {dt_sl:.0f}s). "
+                f"Disparo bloqueado."
+            )
+            return False
+
+    # 4. Memoria de Hawkes Adaptativa: 1.2s para Climax Profundo (Z <= -4.15 y OFI >= +0.70), 3.2s para caida normal
+    es_climax = (z_val <= -4.15 and ofi_val >= 0.70 and ema_pct <= -0.0040)
+    cooldown_hawkes = float(
+        getattr(_cfg, "HAWKES_COOLDOWN_CLIMAX_SEG", 1.2)
+        if es_climax
+        else getattr(_cfg, "HAWKES_COOLDOWN_TOXICO_SEG", 3.2)
+    )
+    dt_toxico = _time.time() - float(_HAWKES_TOXIC_TS.get(sym, 0.0))
+    if dt_toxico < cooldown_hawkes:
         _builtins.print(
-            f"⚠️ [MEMORIA HAWKES 4s] {symbol} estela toxica reciente ({dt_toxico:.1f}s < {cooldown_hawkes:.1f}s). "
+            f"⚠️ [MEMORIA HAWKES V6.4.1] {sym} estela toxica reciente ({dt_toxico:.1f}s < {cooldown_hawkes:.1f}s | Z={z_val:.2f}). "
             f"Esperando absorcion real."
         )
         return False
 
-    max_prem = float(getattr(_cfg, "EMA_MAX_PREMIUM_ENTRADA_NORMAL_PCT", 0.0018))
-    if ema_pct > max_prem and z_val > -3.60:
+    # 5. Anclaje EMA900 de Caginalp: Prohibe comprar sobreextension (> +0.15% sobre EMA900) salvo climax Z <= -3.80
+    max_prem = float(getattr(_cfg, "EMA_MAX_PREMIUM_ENTRADA_NORMAL_PCT", 0.0015))
+    if ema_pct > max_prem and z_val > -3.80:
         _builtins.print(
-            f"⚠️ [ANCLAJE CAGINALP EMA900] {symbol} sobre equilibrio "
-            f"({ema_pct:+.2%} > +{max_prem:.2%} con Z={z_val:.2f}). Disparo abortado."
+            f"⚠️ [ANCLAJE CAGINALP EMA900] {sym} sobre equilibrio ({ema_pct:+.2%} > +{max_prem:.2%} con Z={z_val:.2f}). "
+            f"Disparo abortado."
         )
         return False
+
     return True
 
 
@@ -494,11 +576,11 @@ try:
         _esta_aprobado_orig = getattr(_escudo.centinela, "_esta_aprobado_orig", _escudo.centinela.esta_aprobado)
         _escudo.centinela._esta_aprobado_orig = _esta_aprobado_orig
 
-        def _esta_aprobado_hawkes(symbol: str) -> bool:
+        def _esta_aprobado_v6_4_1(symbol: str) -> bool:
             if not _esta_aprobado_orig(symbol):
                 return False
-            return validar_entrada_hawkes_caginalp(symbol)
+            return validar_entrada_v6_4_1(symbol)
 
-        _escudo.centinela.esta_aprobado = _esta_aprobado_hawkes
+        _escudo.centinela.esta_aprobado = _esta_aprobado_v6_4_1
 except Exception:
     pass

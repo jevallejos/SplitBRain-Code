@@ -673,19 +673,29 @@ class PositionManager:
 gestor = PositionManager()
 
 
-# === [INYECCION CUANTITATIVA V6.4.0+: ALMGREN-CHRISS MAKER-UNWIND & CORTE LVR] ===
+# === [INYECCION CUANTITATIVA V6.4.1: ALMGREN-CHRISS + ANTI-WICK SL + SL-FEEDBACK] ===
 import builtins as _builtins
+import re as _re
+import sys as _sys
+
+_RE_CIERRE_ROJO = _re.compile(
+    r"CIERRE\s+([A-Z0-9]+/USDT:USDT)\s+\[(SL_EXCHANGE|EARLY_TOXIC_SL|OFI_EXIT|SL)\]\s+[0-9.]+\s*→\s*([0-9.]+)"
+)
 
 
 def calcular_umbral_maker_almgren_chriss(edad_seg: float) -> float:
-    """Curva Hiperbolica de Almgren-Chriss (2000) y Avellaneda-Stoikov (2008) con persistencia PFQI."""
+    """Curva Hiperbolica de Almgren-Chriss (2000) y Avellaneda-Stoikov (2008) para V6.4.1:
+    - 0s a 60s:    +0.52% bruto (~+0.056 USDT netos)
+    - 60s a 115s:  Decaimiento hiperbolico de +0.44% a +0.28% (elimina salidas pobres de +0.11% a los 70s)
+    - 115s a 180s: Piso de salida pasiva en +0.20% bruto para ahorrar comision Taker antes de 180s.
+    """
     import math as _m
     import config_parametros as _cfg
 
     t_max = float(getattr(_cfg, "TIEMPO_MAX_HOLD_SEG", 180.0))
     p_ini = float(getattr(_cfg, "MAKER_UNWIND_ACTIVACION_PCT", 0.0052))
-    p_fin = float(getattr(_cfg, "MAKER_UNWIND_TARDIO_PCT", 0.0022))
-    kappa = float(getattr(_cfg, "ALMGREN_CHRISS_KAPPA", 2.20))
+    p_fin = float(getattr(_cfg, "MAKER_UNWIND_TRAMO3_PCT", 0.0020))
+    kappa = float(getattr(_cfg, "ALMGREN_CHRISS_KAPPA", 2.10))
 
     if edad_seg <= 60.0:
         return p_ini
@@ -694,26 +704,24 @@ def calcular_umbral_maker_almgren_chriss(edad_seg: float) -> float:
     return round(p_fin + (p_ini - p_fin) * factor_sinh, 6)
 
 
-def evaluar_corte_lvr_incondicional(edad_seg: float, pnl_pct: float, ofi_10s: float) -> bool:
-    """Control de Loss-Versus-Rebalancing (Milionis et al., 2022) y CVaR 95%."""
-    import config_parametros as _cfg
-
-    min_edad = float(getattr(_cfg, "EARLY_TOXIC_CHECK_SEG", 45))
-    if edad_seg < min_edad:
-        return False
-    loss_std = float(getattr(_cfg, "EARLY_TOXIC_LOSS_PCT", -0.0065))
-    loss_hard = float(getattr(_cfg, "EARLY_TOXIC_HARD_LOSS_PCT", -0.0072))
-    ofi_max = float(getattr(_cfg, "EARLY_TOXIC_OFI_MAX", -0.15))
-    return (pnl_pct <= loss_std and ofi_10s <= ofi_max) or (pnl_pct <= loss_hard)
-
-
-def _print_interceptor_gestor(*args, **kwargs):
+def _print_interceptor_gestor_v6_4_1(*args, **kwargs):
     texto_msg = " ".join(str(a) for a in args)
     if "Fallo sincronizando SL Bybit" in texto_msg and (
         "10001" in texto_msg or "zero position" in texto_msg.lower() or "110017" in texto_msg
     ):
         return None
+
+    m_sl = _RE_CIERRE_ROJO.search(texto_msg)
+    if m_sl:
+        sym_sl, _, px_str = m_sl.groups()
+        try:
+            radar_mod = _sys.modules.get("1_radar_volatilidad")
+            if radar_mod is not None and hasattr(radar_mod, "registrar_cierre_sl_estructural"):
+                radar_mod.registrar_cierre_sl_estructural(sym_sl, float(px_str))
+        except Exception:
+            pass
+
     return _builtins.print(*args, **kwargs)
 
 
-print = _print_interceptor_gestor
+print = _print_interceptor_gestor_v6_4_1
