@@ -1,0 +1,57 @@
+{
+  "timestamp_utc": "2026-10-16 20:41:53 UTC",
+  "fuentes": [
+    "Semilla Verificada sniper-tokio (Transacciones.txt #275)"
+  ],
+  "total_trades_analizados": 45,
+  "baseline_sin_filtros": {
+    "n": 45.0,
+    "pnl_total": 0.84284749905,
+    "win_rate": 64.44444444444444,
+    "expectativa_usdt": 0.018729944423333332
+  },
+  "gran_coalicion_v643": {
+    "n": 31.0,
+    "pnl_total": 1.817570346,
+    "win_rate": 77.41935483870968,
+    "expectativa_usdt": 0.05863130148387096
+  },
+  "shapley_values": {
+    "G1_PURGA_OOS": {
+      "pnl_total": 0.31150924299999994,
+      "win_rate": 7.438874348341523,
+      "expectativa_usdt": 0.012278611635192921
+    },
+    "G2_TIERING_Z": {
+      "pnl_total": 0.09857408400000006,
+      "win_rate": 5.90005999218971,
+      "expectativa_usdt": 0.008755084784316055
+    },
+    "G3_OFI_GLOSTEN": {
+      "pnl_total": -0.505439,
+      "win_rate": -1.5254391045038245,
+      "expectativa_usdt": -0.011322050098300113
+    },
+    "G4_MAKER_ALMGREN": {
+      "pnl_total": 0.24973878495000001,
+      "win_rate": 0.0,
+      "expectativa_usdt": 0.006153046159571275
+    },
+    "G5_ANTI_WICK_KNIFE": {
+      "pnl_total": 0.820339735,
+      "win_rate": 1.1614151582378298,
+      "expectativa_usdt": 0.024036664579757498
+    }
+  },
+  "diagnostico_logs_cola": {
+    "total_vetos_hawkes": 21,
+    "desbloqueables_por_signo_v643": 18,
+    "ordenes_no_llenadas_por_par": {
+      "ZEREBRO/USDT:USDT": 1,
+      "INJ/USDT:USDT": 1
+    },
+    "total_ordenes_no_llenadas": 2,
+    "activaciones_contagio": 8,
+    "anomalias_ignoradas_por_bloqueo": 174
+  }
+}
