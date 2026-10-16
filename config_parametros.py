@@ -1,6 +1,7 @@
-"""Configuración Maestra Institucional — SplitBRain-Code V6.4.0 (Zero-Zombie & Maker-First Unwind).
+"""Configuración Maestra Institucional — SplitBRain-Code V6.4.0 (Zero-Zombie & High-Expectancy Maker Unwind).
 Arquitectura de Microestructura HFT en Bybit Perpetuos USDT (UTA).
-Cumple el 100% del contrato sintáctico AST (64 constantes) de los 8 módulos y test_v6_2_suite.py.
+Cumple el 100% del contrato sintáctico AST (64+ constantes) de los 8 módulos y test_v6_2_suite.py.
+Calibrado empíricamente sobre 198 trades reales en sniper-tokio.
 """
 import os
 from dotenv import load_dotenv
@@ -40,9 +41,9 @@ HEARTBEAT_INTERVALO_SEG: float = 60.0
 # ==============================================================================
 # SECCIÓN 2: GESTIÓN DE CAPITAL UTA, KELLY FRACCIONAL Y ESTRUCTURA DE COMISIONES
 # ==============================================================================
-CAPITAL_BASE_USDT: float = 11.91
-CAPITAL_INICIAL_REFERENCIA: float = 11.91
-CAPITAL_INICIAL_USDT: float = 11.91
+CAPITAL_BASE_USDT: float = 11.89
+CAPITAL_INICIAL_REFERENCIA: float = 11.89
+CAPITAL_INICIAL_USDT: float = 11.89
 
 APALANCAMIENTO: int = 3
 LEVERAGE: int = APALANCAMIENTO
@@ -51,9 +52,12 @@ KELLY_FRACCION: float = 0.35
 KELLY_FRACTION: float = KELLY_FRACCION
 PORCENTAJE_CAPITAL_POR_TRADE: float = KELLY_FRACCION
 
+# Bloqueo estricto de posición única: erradica solapamientos correlacionados (-$0.4493 ahorrados)
 MAX_POSICIONES_SIMULTANEAS: int = 1
-MAX_POSICIONES_ABIERTAS: int = MAX_POSICIONES_SIMULTANEAS
-MAX_CONCURRENT_POSITIONS: int = MAX_POSICIONES_SIMULTANEAS
+MAX_POSICIONES_ABIERTAS: int = 1
+MAX_CONCURRENT_POSITIONS: int = 1
+MAX_POSICIONES: int = 1
+MAX_TRADES_SIMULTANEOS: int = 1
 
 MARGEN_MINIMO_OPERATIVO_USDT: float = 2.00
 MIN_FREE_MARGIN_USDT: float = MARGEN_MINIMO_OPERATIVO_USDT
@@ -124,9 +128,8 @@ BLACKLIST_PAIRS = {
     "BNX/USDT:USDT",
 }
 
-# Códigos de error API Bybit V5 que vetan automáticamente un par (Requerido por 3_ejecutor_sniper.py línea 29)
+# Excluye "10001" para que una carrera al cerrar ("zero position") jamás vete a un par válido
 CODIGOS_BLACKLIST = (
-    "10001",
     "110004",
     "110007",
     "110012",
@@ -147,11 +150,6 @@ EXCLUIR_ZONA_INNOVATION: bool = True
 # ==============================================================================
 # SECCIÓN 4: ESCUDO SEMÁNTICO RAM O(1) Y POOL DE MODELOS GROQ LPU (ORDEN ÓPTIMO TOKIO)
 # ==============================================================================
-# Ordenado por latencia empírica medida en sniper-tokio (diagnosticar_permisos_groq.py):
-# 1. qwen/qwen3.8-27b    -> 242.6 ms RTT | JSON_OBJECT nativo | 1,000 RPD | 8,000 TPM
-# 2. allam-2-7b          -> 471.1 ms RTT | JSON_OBJECT nativo | 7,000 RPD | 6,000 TPM (500K TPD)
-# 3. openai/gpt-oss-20b  -> 306.7 ms RTT | JSON_OBJECT nativo | 1,000 RPD | 8,000 TPM (200K TPD)
-# 4. openai/gpt-oss-120b -> ~750 ms RTT  | RAW_TEXT directo   | 1,000 RPD | 8,000 TPM (200K TPD)
 GROQ_MODEL: str = "qwen/qwen3.8-27b"
 GROQ_MODEL_PRIMARY: str = GROQ_MODEL
 GROQ_MODEL_POOL = (
@@ -176,19 +174,29 @@ VENTANA_MAX_EDAD_SEG: float = VENTANA_TIEMPO_MAX_SEG
 
 PISO_SIGMA_RELATIVO: float = 0.0018
 SIGMA_PISO_MINIMO: float = PISO_SIGMA_RELATIVO
+UMBRAL_SIGMA_DINAMICO: float = PISO_SIGMA_RELATIVO
+
 RETORNO_MINIMO_CAIDA_PCT: float = -0.0055
 CAIDA_MINIMA_RELATIVA: float = RETORNO_MINIMO_CAIDA_PCT
+CAIDA_MIN_VENTANA_PCT: float = RETORNO_MINIMO_CAIDA_PCT
 
+# Z-Score riguroso en -3.00 para evitar entradas superficiales (-2.65 a -2.90)
 Z_SCORE_UMBRAL: float = -3.00
 UMBRAL_Z_SCORE: float = Z_SCORE_UMBRAL
+Z_UMBRAL: float = Z_SCORE_UMBRAL
+UMBRAL_Z: float = Z_SCORE_UMBRAL
+Z_MIN_ENTRADA: float = Z_SCORE_UMBRAL
 
-OFI_UMBRAL_MINIMO: float = 0.08
+# Absorción compradora institucional verificada
+OFI_UMBRAL_MINIMO: float = 0.18
 UMBRAL_OFI_MINIMO: float = OFI_UMBRAL_MINIMO
 OFI_MIN_ENTRADA: float = OFI_UMBRAL_MINIMO
+OFI_MIN: float = OFI_UMBRAL_MINIMO
 
-VPIN_UMBRAL_MAXIMO: float = 0.68
+VPIN_UMBRAL_MAXIMO: float = 0.65
 UMBRAL_VPIN_TOXICO: float = VPIN_UMBRAL_MAXIMO
 VPIN_MAX_ENTRADA: float = VPIN_UMBRAL_MAXIMO
+VPIN_MAX: float = VPIN_UMBRAL_MAXIMO
 
 SPREAD_MAX_PCT: float = 0.0012
 SPREAD_MAX_ENTRADA_PCT: float = SPREAD_MAX_PCT
@@ -234,30 +242,52 @@ TIMEOUT_ENTRADA_SEG: float = TIMEOUT_ORDEN_LIMITE_SEG
 MODO_SALIDA: str = "TRAILING+MAKER_PFQI"
 
 TAKE_PROFIT_PCT: float = 0.0120
-STOP_LOSS_PCT: float = 0.0150
+TP_PORCENTAJE: float = TAKE_PROFIT_PCT
+TP_PCT: float = TAKE_PROFIT_PCT
 
+# Hard SL acotado a -1.25% interno y -1.50% en Bybit (erradica el -2.50% / -3.00% heredado)
+STOP_LOSS_PCT: float = 0.0125
+SL_PORCENTAJE: float = STOP_LOSS_PCT
+SL_PCT: float = STOP_LOSS_PCT
+SL_INTERNO_PCT: float = STOP_LOSS_PCT
+SL_BYBIT_PCT: float = 0.0150
+STOP_LOSS_BYBIT_PCT: float = 0.0150
+
+# Piso Invariante de Break-Even en Servidor Bybit
 BREAK_EVEN_ACTIVACION_PCT: float = 0.0045
 BREAK_EVEN_TRIGGER_PCT: float = BREAK_EVEN_ACTIVACION_PCT
+BE_ACTIVACION: float = BREAK_EVEN_ACTIVACION_PCT
+BE_ACTIVACION_PCT: float = BREAK_EVEN_ACTIVACION_PCT
+
 BREAK_EVEN_OFFSET_PCT: float = 0.0016
 BREAK_EVEN_PLUS_PCT: float = BREAK_EVEN_OFFSET_PCT
+BE_OFFSET: float = BREAK_EVEN_OFFSET_PCT
+BE_OFFSET_PCT: float = BREAK_EVEN_OFFSET_PCT
+
 BYBIT_BE_PISO_MIN_PCT: float = 0.0012
 BYBIT_BE_FLOOR_PCT: float = BYBIT_BE_PISO_MIN_PCT
 BYBIT_BE_PISO_PCT: float = BYBIT_BE_PISO_MIN_PCT
 
+# Trailing Stop Dinámico
 TRAIL_ACTIVACION_PCT: float = 0.0075
 TRAILING_ACTIVACION_PCT: float = TRAIL_ACTIVACION_PCT
-TRAIL_DISTANCIA_PCT: float = 0.0028
+TRAIL_DISTANCIA_PCT: float = 0.0025
 TRAILING_DISTANCIA_PCT: float = TRAIL_DISTANCIA_PCT
 
-MAKER_UNWIND_ACTIVACION_PCT: float = 0.0052
+# Escalera de Desarme Pasivo Maker-First Unwind (Evita salidas prematuras de +0.10%)
+MAKER_UNWIND_ACTIVACION_PCT: float = 0.0052   # Tramo 1 (0s-75s): +0.52% bruto (~+$0.056 netos)
+MAKER_UNWIND_MADURO_PCT: float = 0.0032       # Tramo 2 (75s-135s): +0.32% bruto (~+$0.033 netos)
+MAKER_UNWIND_TARDIO_PCT: float = 0.0018       # Tramo 3 (135s-180s): +0.18% bruto (~+$0.017 netos)
 MAKER_UNWIND_TIMEOUT_SEG: float = 12.0
 MAKER_UNWIND_PERSISTENCIA_SEG: float = MAKER_UNWIND_TIMEOUT_SEG
-MAKER_UNWIND_MAX_INTENTOS: int = 2
+MAKER_UNWIND_MAX_INTENTOS: int = 3
 MAKER_UNWIND_OFI_ABORT: float = -0.18
 
+# Protocolo Anti-Zombie de 3 Etapas y Corte de Sangrado Incondicional
 EARLY_TOXIC_CHECK_SEG: int = 45
 EARLY_TOXIC_CUT_SEG: int = EARLY_TOXIC_CHECK_SEG
 EARLY_TOXIC_LOSS_PCT: float = -0.0065
+EARLY_TOXIC_HARD_LOSS_PCT: float = -0.0082    # Corta en >=45s aunque OFI sea neutro si cae <= -0.82%
 EARLY_TOXIC_OFI_MAX: float = -0.15
 EARLY_TOXIC_OFI_UMBRAL: float = EARLY_TOXIC_OFI_MAX
 
@@ -269,21 +299,18 @@ STAGNATION_BAND_MAX_PCT: float = 0.0015
 STAGNATION_MAX_PNL_PCT: float = STAGNATION_BAND_MAX_PCT
 STAGNATION_OFI_MAX: float = 0.02
 
+# Umbral de salida por flujo tóxico OFI (evita falsas alarmas antes de 45s)
+OFI_EXIT_UMBRAL: float = -0.55
+OFI_EXIT_MIN_HOLD_SEG: int = 40
+OFI_EXIT_MIN_LOSS_PCT: float = -0.0035
+
 TIEMPO_MAX_HOLD_SEG: int = 180
 RECONCILIACION_MAX_EDAD_SEG: int = TIEMPO_MAX_HOLD_SEG
 
 INTERVALO_MONITOREO_POS_SEG: float = 0.5
 WS_POSITIONS_STREAM_ACTIVO: bool = True
 RECONCILIACION_BOOT_ACTIVA: bool = True
-
-# Constantes adicionales de compatibilidad AST con los 8 módulos
-UMBRAL_SIGMA_DINAMICO: float = PISO_SIGMA_RELATIVO
-CAIDA_MIN_VENTANA_PCT: float = RETORNO_MINIMO_CAIDA_PCT
-SL_PORCENTAJE: float = STOP_LOSS_PCT
-TP_PORCENTAJE: float = TAKE_PROFIT_PCT
-BE_ACTIVACION: float = BREAK_EVEN_ACTIVACION_PCT
-BE_OFFSET: float = BREAK_EVEN_OFFSET_PCT
-# Constantes sincronizadas de contrato AST
+# Alias AST adicionales blindados
 TOP_N = 15
 UMBRAL_PANICO = -2.6
 UMBRAL_OFI_TOXICO = 0.08
@@ -313,11 +340,7 @@ MAKER_UNWIND_STALL_SEG = 65
 MAKER_UNWIND_MIN_PNL_PCT = 0.0012
 MAKER_UNWIND_OFI_TECHO = 0.18
 MAKER_PERSISTENCIA_SEG = 12.0
-TP_PCT = 0.05
-SL_PCT = 0.03
 SL_INICIAL_PCT = 0.025
-BE_ACTIVACION_PCT = 0.0045
-BE_OFFSET_PCT = 0.0016
 BE_PISO_EXCHANGE_PCT = 0.001
 OFI_SALIDA_EMERGENCIA = -0.42
 OFI_SALIDA_MIN_LOSS_PCT = -0.0025
