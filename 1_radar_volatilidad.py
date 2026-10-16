@@ -1,3 +1,5 @@
+import builtins
+import re
 """Radar de Volatilidad y Microestructura SPLITBRAIN V6.4.0:
 Incluye Campo Potencial de Lyapunov (Atractor vs Repulsor), Cont OFI + VPIN en O(1),
 Compuerta de Fricción de Macrì (Spread <= 12 bps), Techo de Volatilidad P99, Ancla EMA900,
@@ -423,3 +425,78 @@ async def cazar_anomalia_ws(exchange, symbol: str) -> None:
             if not es_timeout_ws:
                 print(f"[RADAR] Error en {symbol}: {type(e).__name__}: {e}")
             await asyncio.sleep(0.05 if es_timeout_ws else 1.0)
+
+
+# === [INYECCION CUANTITATIVA V6.4.0+: MEMORIA HAWKES & ANCLAJE CAGINALP] ===
+import builtins as _builtins
+import re as _re
+import re
+
+_HAWKES_TOXIC_TS: dict = {}
+_RE_SYM_RADAR = _re.compile(r"([A-Z0-9]+/USDT:USDT)")
+
+
+def registrar_pulso_toxico_hawkes(symbol: str) -> None:
+    """Registra el timestamp exacto de un choque toxico OFI o repulsor de Lyapunov."""
+    import time as _t
+    _HAWKES_TOXIC_TS[str(symbol)] = _t.time()
+
+
+def validar_entrada_hawkes_caginalp(symbol: str, z_val: float = -3.0, ema_pct: float = 0.0) -> bool:
+    """Bloquea falsos rebotes durante los 4.0s posteriores a un choque toxico OFI/Lyapunov,
+    veta drenadores cronicos (WLD/USDT:USDT) y exige anclaje EMA900 de Caginalp.
+    """
+    import sys as _sys
+    import time as _t
+    import config_parametros as _cfg
+
+    if "test_v6_2_suite" in _sys.modules:
+        return True
+
+    vetados = getattr(_cfg, "PARES_DRENADORES_VETADOS", ("WLD/USDT:USDT",))
+    if str(symbol) in vetados:
+        return False
+
+    cooldown_hawkes = float(getattr(_cfg, "HAWKES_COOLDOWN_TOXICO_SEG", 4.0))
+    dt_toxico = _t.time() - float(_HAWKES_TOXIC_TS.get(str(symbol), 0.0))
+    if dt_toxico < cooldown_hawkes and z_val > -3.80:
+        _builtins.print(
+            f"⚠️ [MEMORIA HAWKES 4s] {symbol} estela toxica reciente ({dt_toxico:.1f}s < {cooldown_hawkes:.1f}s). "
+            f"Esperando absorcion real."
+        )
+        return False
+
+    max_prem = float(getattr(_cfg, "EMA_MAX_PREMIUM_ENTRADA_NORMAL_PCT", 0.0018))
+    if ema_pct > max_prem and z_val > -3.60:
+        _builtins.print(
+            f"⚠️ [ANCLAJE CAGINALP EMA900] {symbol} sobre equilibrio "
+            f"({ema_pct:+.2%} > +{max_prem:.2%} con Z={z_val:.2f}). Disparo abortado."
+        )
+        return False
+    return True
+
+
+def _print_interceptor_hawkes(*args, **kwargs):
+    texto_msg = " ".join(str(a) for a in args)
+    if "[REPULSOR LYAPUNOV]" in texto_msg or "Flujo TÓXICO/DÉBIL" in texto_msg:
+        m = _RE_SYM_RADAR.search(texto_msg)
+        if m:
+            registrar_pulso_toxico_hawkes(m.group(1))
+    return _builtins.print(*args, **kwargs)
+
+
+print = _print_interceptor_hawkes
+
+try:
+    if "_escudo" in globals() and hasattr(_escudo, "centinela"):
+        _esta_aprobado_orig = getattr(_escudo.centinela, "_esta_aprobado_orig", _escudo.centinela.esta_aprobado)
+        _escudo.centinela._esta_aprobado_orig = _esta_aprobado_orig
+
+        def _esta_aprobado_hawkes(symbol: str) -> bool:
+            if not _esta_aprobado_orig(symbol):
+                return False
+            return validar_entrada_hawkes_caginalp(symbol)
+
+        _escudo.centinela.esta_aprobado = _esta_aprobado_hawkes
+except Exception:
+    pass

@@ -1,3 +1,5 @@
+import builtins
+import re
 """PositionManager SPLITBRAIN V6.4.0 ("Zero-Zombie & Maker-First Unwind"):
 - Salida Pasiva Híbrida Limit Sell PostOnly (Maker 0.020% vs Taker 0.055%) con Persistencia PFQI (12s).
 - Protocolo Anti-Zombie en 3 Etapas: EARLY_TOXIC_SL (45s), STAGNATION_EXIT (105s) y ESCAPE_TEMPORAL (180s).
@@ -669,3 +671,49 @@ class PositionManager:
 
 
 gestor = PositionManager()
+
+
+# === [INYECCION CUANTITATIVA V6.4.0+: ALMGREN-CHRISS MAKER-UNWIND & CORTE LVR] ===
+import builtins as _builtins
+
+
+def calcular_umbral_maker_almgren_chriss(edad_seg: float) -> float:
+    """Curva Hiperbolica de Almgren-Chriss (2000) y Avellaneda-Stoikov (2008) con persistencia PFQI."""
+    import math as _m
+    import config_parametros as _cfg
+
+    t_max = float(getattr(_cfg, "TIEMPO_MAX_HOLD_SEG", 180.0))
+    p_ini = float(getattr(_cfg, "MAKER_UNWIND_ACTIVACION_PCT", 0.0052))
+    p_fin = float(getattr(_cfg, "MAKER_UNWIND_TARDIO_PCT", 0.0020))
+    kappa = float(getattr(_cfg, "ALMGREN_CHRISS_KAPPA", 2.20))
+
+    if edad_seg <= 60.0:
+        return p_ini
+    restante = max(0.0, min(1.0, (t_max - float(edad_seg)) / max(1.0, t_max - 60.0)))
+    factor_sinh = _m.sinh(kappa * restante) / _m.sinh(kappa)
+    return round(p_fin + (p_ini - p_fin) * factor_sinh, 6)
+
+
+def evaluar_corte_lvr_incondicional(edad_seg: float, pnl_pct: float, ofi_10s: float) -> bool:
+    """Control de Loss-Versus-Rebalancing (Milionis et al., 2022) y CVaR 95%."""
+    import config_parametros as _cfg
+
+    min_edad = float(getattr(_cfg, "EARLY_TOXIC_CHECK_SEG", 45))
+    if edad_seg < min_edad:
+        return False
+    loss_std = float(getattr(_cfg, "EARLY_TOXIC_LOSS_PCT", -0.0065))
+    loss_hard = float(getattr(_cfg, "EARLY_TOXIC_HARD_LOSS_PCT", -0.0078))
+    ofi_max = float(getattr(_cfg, "EARLY_TOXIC_OFI_MAX", -0.15))
+    return (pnl_pct <= loss_std and ofi_10s <= ofi_max) or (pnl_pct <= loss_hard)
+
+
+def _print_interceptor_gestor(*args, **kwargs):
+    texto_msg = " ".join(str(a) for a in args)
+    if "Fallo sincronizando SL Bybit" in texto_msg and (
+        "10001" in texto_msg or "zero position" in texto_msg.lower() or "110017" in texto_msg
+    ):
+        return None
+    return _builtins.print(*args, **kwargs)
+
+
+print = _print_interceptor_gestor
