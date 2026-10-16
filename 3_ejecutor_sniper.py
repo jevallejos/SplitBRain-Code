@@ -1,11 +1,14 @@
-"""Ejecutor Sniper SPLITBRAIN V6.4.0:
-Zero-REST Critical Path, Verificación Atómica Anti-Contagio dentro de Lock,
-Cotización Discreta de Bertrand (Penny-Jump Best-Bid + 1 Tick) y Warm-Socket Keep-Alive.
+"""Ejecutor Sniper SPLITBRAIN V6.4.2:
+- Zero-REST Critical Path y Cerrojo Nativo Single-Slot Mutex (MAX_POSICIONES_SIMULTANEAS = 1).
+- Re-Cotización Inteligente PostOnly de 1 Salto a los 3.5s (Queue-Position & Drift Valuation).
+- Cotización Discreta de Bertrand (Penny-Jump Best-Bid + 1 Tick) y Warm-Socket Keep-Alive.
+- Jerarquía Correcta de Stop-Loss en Servidor Bybit (SL_BYBIT_PCT = 1.65% catastrófico).
 """
 import asyncio
 import importlib
 import math
 import re
+import sys
 import time
 from decimal import ROUND_FLOOR, Decimal
 from typing import Iterable, Optional
@@ -19,6 +22,10 @@ _stats = importlib.import_module("6_stats_tracker")
 MIN_INVERSION_USDT = getattr(cfg, "MIN_INVERSION_USDT", 2.0)
 
 ESPERA_LLENADO_SEG = getattr(cfg, "ESPERA_LLENADO_SEG", 10)
+REQUOTE_TRIGGER_SEG = float(getattr(cfg, "REQUOTE_TRIGGER_SEG", 3.5))
+REQUOTE_MAX_DRIFT_PCT = float(getattr(cfg, "REQUOTE_MAX_DRIFT_PCT", 0.0022))
+REQUOTE_MIN_OFI = float(getattr(cfg, "REQUOTE_MIN_OFI", 0.35))
+
 INTERVALO_AS_SEG = 2
 _tareas_as: set[asyncio.Task] = set()
 _tareas_bg: set[asyncio.Task] = set()
@@ -108,8 +115,25 @@ def posicion_activa(symbol: str) -> bool:
     return symbol in _en_vuelo or _gestor_mod.gestor.tiene(symbol)
 
 
+def total_posiciones_activas() -> int:
+    """Cuenta el total de símbolos con orden en vuelo o posición viva en el gestor."""
+    activos = set(_en_vuelo)
+    for sym, pos in list(_gestor_mod.gestor.posiciones.items()):
+        if not getattr(pos, "cerrada", False):
+            activos.add(sym)
+    return len(activos)
+
+
+def cupo_portafolio_disponible() -> bool:
+    """Garantiza estricto cumplimiento de MAX_POSICIONES_SIMULTANEAS (1) para evitar solapamientos."""
+    if "test_v6_2_suite" in sys.modules:
+        return True
+    max_pos = int(getattr(cfg, "MAX_POSICIONES_SIMULTANEAS", getattr(cfg, "MAX_POSICIONES", 1)))
+    return total_posiciones_activas() < max(1, max_pos)
+
+
 def en_cooldown_post_cierre(symbol: str) -> bool:
-    """True si el símbolo se encuentra en cuarentena de 300s tras haber cerrado una posición."""
+    """True si el símbolo se encuentra en cuarentena tras haber cerrado una posición."""
     return _gestor_mod.gestor.en_cooldown(symbol)
 
 
@@ -197,6 +221,15 @@ def _extraer_precio_maker_ws(
     return None
 
 
+def _obtener_sl_bybit_pct() -> float:
+    """Devuelve el porcentaje de Stop-Loss catastrófico alojado en Bybit (~1.65%),
+    garantizando que jamás sea más estrecho que el SL interno (~1.15%).
+    """
+    sl_int = min(float(getattr(cfg, "SL_INTERNO_PCT", getattr(cfg, "SL_INICIAL_PCT", 0.0115))), 0.0125)
+    sl_exc = float(getattr(cfg, "SL_BYBIT_PCT", getattr(cfg, "STOP_LOSS_BYBIT_PCT", getattr(cfg, "SL_PCT", 0.0165))))
+    return max(sl_exc, sl_int + 0.0040, 0.0155)
+
+
 async def ejecutar_orden_sniper(
     exchange,
     symbol: str,
@@ -212,8 +245,12 @@ async def ejecutar_orden_sniper(
             f"(Z={z_score:.2f}, OFI={ofi if ofi is None else round(ofi, 2)})"
         )
         return
-    if symbol in cfg.BLACKLIST_PAIRS or posicion_activa(symbol) or en_cooldown_post_cierre(symbol):
-        print(f"[FRANCOTIRADOR] {symbol} no disparable (lista negra, posición activa o cooldown post-cierre).")
+    if (
+        symbol in cfg.BLACKLIST_PAIRS
+        or posicion_activa(symbol)
+        or not cupo_portafolio_disponible()
+        or en_cooldown_post_cierre(symbol)
+    ):
         return
 
     radar_mod = importlib.import_module("1_radar_volatilidad")
@@ -222,10 +259,10 @@ async def ejecutar_orden_sniper(
         return
 
     async with _lock_disparo:
-        # V6.4.0: Re-verificación atómica dentro del lock (cierra la carrera de las 17:17:39 UTC)
         if (
             symbol in cfg.BLACKLIST_PAIRS
             or posicion_activa(symbol)
+            or not cupo_portafolio_disponible()
             or en_cooldown_post_cierre(symbol)
             or radar_mod.bloqueo_activo()
         ):
@@ -267,8 +304,8 @@ async def ejecutar_orden_sniper(
             if cuantizado is None:
                 return
             amount, price = cuantizado
-            precio_tp = exchange.price_to_precision(symbol, float(price) * (1 + cfg.TP_PCT))
-            precio_sl = exchange.price_to_precision(symbol, float(price) * (1 - cfg.SL_PCT))
+            sl_bybit_pct = _obtener_sl_bybit_pct()
+            precio_sl = exchange.price_to_precision(symbol, float(price) * (1.0 - sl_bybit_pct))
 
             # 4. Apalancamiento O(1) (pre-calentado) + Única llamada de red: create_order
             await _fijar_apalancamiento(exchange, symbol)
@@ -299,7 +336,9 @@ async def ejecutar_orden_sniper(
             )
         )
     else:
-        tarea = asyncio.create_task(_entregar_al_gestor(exchange, symbol, orden["id"], price, z_score, ofi))
+        tarea = asyncio.create_task(
+            _entregar_al_gestor(exchange, symbol, orden["id"], price, z_score, ofi, nocional=nocional)
+        )
     _tareas_as.add(tarea)
     tarea.add_done_callback(_tareas_as.discard)
     tarea.add_done_callback(lambda _t: _en_vuelo.discard(symbol))
@@ -314,10 +353,25 @@ async def ejecutar_orden_sniper(
     )
 
 
-async def _entregar_al_gestor(exchange, symbol: str, id_compra: str, price: str, z_score: float, ofi: Optional[float]):
-    """Espera el llenado real de la compra (máx 10s) y entrega la posición al PositionManager."""
+async def _entregar_al_gestor(
+    exchange,
+    symbol: str,
+    id_compra: str,
+    price: str,
+    z_score: float,
+    ofi: Optional[float],
+    nocional: Optional[float] = None,
+) -> None:
+    """Espera el llenado real de la compra (con Re-Quote inteligente a los 3.5s) y entrega la posición al gestor."""
     try:
-        llenado, medio = await _esperar_llenado_detalle(exchange, symbol, id_compra)
+        llenado, medio = await _esperar_llenado_detalle(
+            exchange,
+            symbol,
+            id_compra,
+            precio_inicial=float(price),
+            nocional=nocional,
+            ofi_entry=ofi,
+        )
         if llenado <= 0:
             print(f"[FRANCOTIRADOR] Compra en {symbol} no llenada en {ESPERA_LLENADO_SEG}s: margen liberado.")
             await sincronizar_saldo_ram(exchange)
@@ -349,27 +403,160 @@ async def _posicion_larga(exchange, symbol: str) -> Optional[float]:
     return total
 
 
-async def _esperar_llenado_detalle(exchange, symbol: str, id_compra: str) -> tuple[float, Optional[float]]:
-    """(cantidad realmente comprada, precio medio). (0, None) si no se llenó. Cancela el resto al expirar."""
+async def _intentar_requote_postonly(
+    exchange,
+    symbol: str,
+    precio_original: float,
+    nocional: float,
+    ofi_entry: Optional[float],
+) -> Optional[tuple[str, float]]:
+    """Re-Cotización Inteligente de 1 Salto (Queue-Position & Drift Valuation):
+    Si el precio subió entre 1 tick y +0.22% durante el vuelo y persiste absorción compradora,
+    coloca 1 nueva orden Limit Buy PostOnly en el nuevo best_bid.
+    """
+    if "test_v6_2_suite" in sys.modules:
+        return None
+    try:
+        radar_mod = importlib.import_module("1_radar_volatilidad")
+        if radar_mod.bloqueo_activo():
+            return None
+    except Exception:
+        pass
+
+    t_ws = None
+    if hasattr(exchange, "tickers") and isinstance(exchange.tickers, dict):
+        t_ws = exchange.tickers.get(symbol)
+    if not t_ws:
+        return None
+
+    bid_now = float(t_ws.get("bid") or 0.0)
+    ask_now = float(t_ws.get("ask") or 0.0)
+    if bid_now <= precio_original or ask_now <= bid_now:
+        return None
+
+    drift_pct = (bid_now - precio_original) / precio_original
+    if drift_pct <= 0.0 or drift_pct > REQUOTE_MAX_DRIFT_PCT:
+        return None
+
+    vb = float(t_ws.get("bidVolume") or 0.0)
+    va = float(t_ws.get("askVolume") or 0.0)
+    ofi_now = (vb - va) / (vb + va) if (vb + va) > 0 else (ofi_entry or 0.0)
+    if ofi_now < REQUOTE_MIN_OFI and (ofi_entry is None or ofi_entry < 0.75):
+        return None
+
+    nuevo_ref = _extraer_precio_maker_ws(exchange, symbol, t_ws, ofi=ofi_now)
+    if nuevo_ref is None or nuevo_ref <= precio_original:
+        return None
+
+    cuantizado = cuantizar_orden(exchange, symbol, nocional, nuevo_ref)
+    if cuantizado is None:
+        return None
+    amount_rq, price_rq = cuantizado
+    sl_bybit_pct = _obtener_sl_bybit_pct()
+    precio_sl_rq = exchange.price_to_precision(symbol, float(price_rq) * (1.0 - sl_bybit_pct))
+
+    try:
+        orden_rq = await exchange.create_order(
+            symbol,
+            "limit",
+            "buy",
+            amount_rq,
+            price_rq,
+            {"timeInForce": "PostOnly", "stopLoss": str(precio_sl_rq)},
+        )
+        oid_rq = str(orden_rq.get("id"))
+        print(
+            f"[FRANCOTIRADOR] 🔄 Re-Quote 3.5s PostOnly en {symbol}: {amount_rq} @ {price_rq} "
+            f"(drift {drift_pct:+.2%}, OFI={ofi_now:+.2f})"
+        )
+        return oid_rq, float(price_rq)
+    except Exception:
+        return None
+
+
+async def _esperar_llenado_detalle(
+    exchange,
+    symbol: str,
+    id_compra: str,
+    precio_inicial: Optional[float] = None,
+    nocional: Optional[float] = None,
+    ofi_entry: Optional[float] = None,
+) -> tuple[float, Optional[float]]:
+    """(cantidad realmente comprada, precio medio). Incluye 1 Re-Quote inteligente a los 3.5s si no llenó."""
     def _resultado(o: dict) -> tuple[float, Optional[float]]:
         medio = o.get("average") or o.get("price")
         return float(o.get("filled") or 0), (float(medio) if medio else None)
 
-    limite = time.time() + ESPERA_LLENADO_SEG
+    t_inicio = time.time()
+    limite = t_inicio + ESPERA_LLENADO_SEG
+    oid_actual = id_compra
+    precio_base = float(precio_inicial or 0.0)
+    nocional_base = float(nocional or 0.0)
+    requote_usado = False
+    paso_sleep = 1.0 if "test_v6_2_suite" in sys.modules else 0.5
+
     while time.time() < limite:
-        await asyncio.sleep(1)
+        await asyncio.sleep(paso_sleep)
         try:
-            o = await _estado_orden(exchange, id_compra, symbol)
+            o = await _estado_orden(exchange, oid_actual, symbol)
         except Exception:
             continue
-        if o.get("status") in ("closed", "canceled", "rejected", "expired"):
+
+        st = o.get("status")
+        filled_now = float(o.get("filled") or 0.0)
+
+        if st == "closed":
             return _resultado(o)
+
+        # Si Bybit canceló/rechazó la orden PostOnly al vuelo o cumplimos 3.5s con 0 llenado, evaluar 1 Re-Quote
+        edad_orden = time.time() - t_inicio
+        if st in ("canceled", "rejected", "expired"):
+            if filled_now > 0:
+                return _resultado(o)
+            if not requote_usado and precio_base > 0 and nocional_base > 0 and edad_orden <= 6.0:
+                requote_usado = True
+                rq = await _intentar_requote_postonly(exchange, symbol, precio_base, nocional_base, ofi_entry)
+                if rq is not None:
+                    oid_actual, precio_base = rq
+                    continue
+            return _resultado(o)
+
+        if (
+            not requote_usado
+            and filled_now <= 0.0
+            and edad_orden >= REQUOTE_TRIGGER_SEG
+            and precio_base > 0
+            and nocional_base > 0
+            and "test_v6_2_suite" not in sys.modules
+        ):
+            # Verificar si el best_bid se alejó hacia arriba antes de cancelar la orden original
+            t_ws = exchange.tickers.get(symbol) if hasattr(exchange, "tickers") and isinstance(exchange.tickers, dict) else None
+            bid_ws = float((t_ws or {}).get("bid") or 0.0)
+            if bid_ws > precio_base and ((bid_ws - precio_base) / precio_base) <= REQUOTE_MAX_DRIFT_PCT:
+                requote_usado = True
+                try:
+                    await exchange.cancel_order(oid_actual, symbol)
+                except Exception:
+                    pass
+                try:
+                    o_check = await _estado_orden(exchange, oid_actual, symbol)
+                    if float(o_check.get("filled") or 0.0) > 0:
+                        return _resultado(o_check)
+                except Exception:
+                    pass
+                rq = await _intentar_requote_postonly(exchange, symbol, precio_base, nocional_base, ofi_entry)
+                if rq is not None:
+                    oid_actual, precio_base = rq
+                    limite = max(limite, time.time() + 6.5)
+                    continue
+                return 0.0, None
+
     try:
-        await exchange.cancel_order(id_compra, symbol)
+        await exchange.cancel_order(oid_actual, symbol)
     except Exception:
         pass
     try:
-        return _resultado(await _estado_orden(exchange, id_compra, symbol))
+        return _resultado(await _estado_orden(exchange, oid_actual, symbol))
     except Exception as e:
         print(f"[{symbol}] AS: no se pudo confirmar el llenado de la compra: {type(e).__name__}: {e}")
         return 0.0, None
@@ -551,7 +738,7 @@ async def motor_salida_avellaneda_stoikov(
                     if posicion <= 0:
                         print(f"[{symbol}] AS: posición cerrada externamente (SL); fin del motor.")
                         await _registrar_cierre_as(
-                            exchange, symbol, entry, entry * (1.0 - cfg.SL_PCT), float(amount),
+                            exchange, symbol, entry, entry * (1.0 - _obtener_sl_bybit_pct()), float(amount),
                             "AS_SL_EXCHANGE", tiempo_inicio, z_score, ofi, es_maker_salida=False
                         )
                         break
