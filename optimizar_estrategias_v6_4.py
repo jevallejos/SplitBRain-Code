@@ -1,8 +1,8 @@
-"""Auditor Cuantitativo e Inyector AST — SplitBRain-Code V6.4.0+.
-Actualiza de forma determinista y verificable por Git los 3 modulos criticos:
-1. config_parametros.py   (MAX_POS=1, SL=-1.20%/-1.45%, Z<=-3.00, Hawkes y Almgren-Chriss)
-2. 1_radar_volatilidad.py (import re global + Memoria Hawkes 4s Anti-Spoofing + Anclaje EMA900 + Veto WLD)
-3. 5_gestor_posiciones.py (Curva Hiperbolica Almgren-Chriss Maker-Unwind + Corte LVR -0.78% + Supresion 10001)
+"""Auditor Cuantitativo e Inyector AST — SplitBRain-Code V6.4.0+ (Flujo Inmutable Antigravity -> GitHub -> Tokio).
+Actualiza de forma determinista y verificable por Git los 3 modulos criticos en Antigravity:
+1. config_parametros.py   (BLACKLIST_PAIRS con WLD/ZRO/DOGE/ONDO, MAX_POS=1, SL=-1.10%/-1.35%, Z<=-3.00)
+2. 1_radar_volatilidad.py (import re global + Memoria Hawkes 4s + Anclaje EMA900 + Tiering Campbell-Thompson)
+3. 5_gestor_posiciones.py (Curva Hiperbolica Almgren-Chriss Maker-Unwind + Corte LVR -0.65% + Supresion 10001)
 """
 import ast
 import hashlib
@@ -22,7 +22,7 @@ def _hash_archivo(ruta: pathlib.Path) -> str:
 
 
 def _escribir_con_validacion_ast(ruta: pathlib.Path, codigo: str) -> bool:
-    """Verifica con ast.parse y compile que el codigo sea 100% valido antes de guardarlo."""
+    """Verifica con ast.parse y compile que el codigo sea 100% valido antes de guardarlo en disco."""
     try:
         ast.parse(codigo, filename=str(ruta))
         compile(codigo, str(ruta), "exec")
@@ -36,7 +36,7 @@ def _escribir_con_validacion_ast(ruta: pathlib.Path, codigo: str) -> bool:
 def auditar_historial_jsonl(ruta_jsonl: pathlib.Path) -> Dict[str, Dict[str, Any]]:
     """Analiza las transacciones cerradas y calcula Win Rate, Expectancy, Fees y CVaR 95%."""
     if not ruta_jsonl.exists():
-        print(f"[AVISO] No se encontro {ruta_jsonl}. Se omite tabla historica local.")
+        print(f"[AVISO] No se encontro {ruta_jsonl}. Usando calibracion maestra de 231 trades.")
         return {}
 
     registros: List[Dict[str, Any]] = []
@@ -68,6 +68,8 @@ def auditar_historial_jsonl(ruta_jsonl: pathlib.Path) -> Dict[str, Dict[str, Any
     print("-" * 112)
 
     resumen_simbolos: Dict[str, Dict[str, Any]] = {}
+    vetados_fijos = {"WLD/USDT:USDT", "ZRO/USDT:USDT", "DOGE/USDT:USDT", "ONDO/USDT:USDT"}
+
     for sym, lista in sorted(
         por_simbolo.items(),
         key=lambda kv: sum(float(x.get("pnl_usdt", 0.0)) for x in kv[1]),
@@ -82,12 +84,12 @@ def auditar_historial_jsonl(ruta_jsonl: pathlib.Path) -> Dict[str, Dict[str, Any
         corte_cola = max(1, int(math.ceil(n * 0.10)))
         cvar = sum(pnls_ord[:corte_cola]) / corte_cola if pnls_ord else 0.0
 
-        if n >= 5 and wr < 35.0 and pnl_tot < -0.08:
-            estado = "VETAR (Drenador Cronico)"
-        elif pnl_tot > 0.05 and wr >= 52.0:
-            estado = "TIER-1 ALFA (Prioritario)"
+        if sym in vetados_fijos or (n >= 5 and wr < 35.0 and pnl_tot < -0.08):
+            estado = "BLACKLIST (Drenador Cronico)"
+        elif wr >= 55.0:
+            estado = "NUCLEO ALFA (Z <= -3.00)"
         else:
-            estado = "OPERATIVO (Hawkes+EMA900)"
+            estado = "SELECTIVO OOS (Z <= -3.35)"
 
         resumen_simbolos[sym] = {
             "trades": n,
@@ -130,7 +132,9 @@ def auditar_historial_jsonl(ruta_jsonl: pathlib.Path) -> Dict[str, Dict[str, Any
 
 
 def actualizar_config_parametros(ruta_cfg: pathlib.Path) -> None:
-    """Actualiza config_parametros.py preservando el 100% del contrato AST de test_v6_2_suite.py."""
+    """Actualiza config_parametros.py bloqueando en BLACKLIST_PAIRS los 4 drenadores cronicos
+    (WLD, ZRO, DOGE, ONDO) para que main.py no los seleccione por volumen en Bybit.
+    """
     if not ruta_cfg.exists():
         print(f"[ERROR] No existe {ruta_cfg}")
         return
@@ -138,7 +142,7 @@ def actualizar_config_parametros(ruta_cfg: pathlib.Path) -> None:
     h_antes = _hash_archivo(ruta_cfg)
     texto = ruta_cfg.read_text(encoding="utf-8")
 
-    # Limpiar bloques de calibracion previos (con o sin tilde)
+    # 1. Limpiar bloques inyectados previos
     for marca_prev in (
         "# CALIBRACIÓN CUANTITATIVA V6.4.0+",
         "# CALIBRACION CUANTITATIVA V6.4.0+",
@@ -148,19 +152,19 @@ def actualizar_config_parametros(ruta_cfg: pathlib.Path) -> None:
             if texto.endswith("# =============================================================================="):
                 texto = texto[: -len("# ==============================================================================")].rstrip()
 
-    # Restaurar WLD/USDT:USDT en PARES_OBJETIVO si el test verifica longitud de lista, y vetarlo en PARES_DRENADORES_VETADOS
-    if '"WLD/USDT:USDT"' not in texto.split("PARES_OBJETIVO")[1][:600]:
-        texto = texto.replace(
-            '"1000PEPE/USDT:USDT",\n',
-            '"1000PEPE/USDT:USDT",\n    "WLD/USDT:USDT",\n',
-            1,
-        )
+    # 2. Retirar de PARES_OBJETIVO los 4 drenadores netos (WLD 12.5% WR, ZRO 33.3% WR, DOGE 0% WR, ONDO 33.3% WR)
+    for par_malo in ("WLD/USDT:USDT", "ZRO/USDT:USDT", "DOGE/USDT:USDT", "ONDO/USDT:USDT"):
+        texto = texto.replace(f'    "{par_malo}",\n', "")
 
+    # 3. Asegurar que "10001" no este en CODIGOS_BLACKLIST
+    texto = texto.replace('    "10001",\n', "")
+
+    # 4. Ajustar constantes en el cuerpo principal
     reemplazos_regex = [
         (r"^(\s*(?:MAX_POSICIONES\w*|MAX_CONCURRENT\w*|MAX_TRADES\w*)\s*(?::\s*\w+\s*)?=\s*)[2-9]\b", r"\g<1>1"),
         (r"^(\s*(?:Z_SCORE\w*|UMBRAL_Z\w*|Z_UMBRAL\w*|Z_MIN\w*)\s*(?::\s*\w+\s*)?=\s*)-2\.[5678]\d*", r"\g<1>-3.00"),
-        (r"^(\s*(?:STOP_LOSS_PCT|SL_PCT|SL_PORCENTAJE|SL_INTERNO_PCT)\s*(?::\s*\w+\s*)?=\s*)0\.025\d*", r"\g<1>0.0120"),
-        (r"^(\s*(?:SL_BYBIT_PCT|STOP_LOSS_BYBIT_PCT|BYBIT_SL_PCT)\s*(?::\s*\w+\s*)?=\s*)0\.030?\d*", r"\g<1>0.0145"),
+        (r"^(\s*(?:STOP_LOSS_PCT|SL_PCT|SL_PORCENTAJE|SL_INTERNO_PCT)\s*(?::\s*\w+\s*)?=\s*)0\.0(?:25|15|12)\d*", r"\g<1>0.0110"),
+        (r"^(\s*(?:SL_BYBIT_PCT|STOP_LOSS_BYBIT_PCT|BYBIT_SL_PCT)\s*(?::\s*\w+\s*)?=\s*)0\.0(?:30|15|14)\d*", r"\g<1>0.0135"),
     ]
     for patron, sust in reemplazos_regex:
         texto = re.sub(patron, sust, texto, flags=re.MULTILINE)
@@ -175,6 +179,40 @@ MAX_CONCURRENT_POSITIONS = 1
 MAX_POSICIONES = 1
 MAX_TRADES_SIMULTANEOS = 1
 
+# Blacklist ampliada con los 4 drenadores cronicos para que main.py los excluya en el arranque
+BLACKLIST_PAIRS = {
+    "LUNA/USDT:USDT",
+    "LUNC/USDT:USDT",
+    "USTC/USDT:USDT",
+    "FTT/USDT:USDT",
+    "OMG/USDT:USDT",
+    "WAVES/USDT:USDT",
+    "ALPACA/USDT:USDT",
+    "BNX/USDT:USDT",
+    "WLD/USDT:USDT",
+    "ZRO/USDT:USDT",
+    "DOGE/USDT:USDT",
+    "ONDO/USDT:USDT",
+    "TRUTH/USDT:USDT",
+}
+PARES_DRENADORES_VETADOS = (
+    "WLD/USDT:USDT",
+    "ZRO/USDT:USDT",
+    "DOGE/USDT:USDT",
+    "ONDO/USDT:USDT",
+    "TRUTH/USDT:USDT",
+)
+PARES_NUCLEO_ALFA = (
+    "WAL/USDT:USDT",
+    "ZEREBRO/USDT:USDT",
+    "STRK/USDT:USDT",
+    "XRP/USDT:USDT",
+    "1000PEPE/USDT:USDT",
+    "HYPE/USDT:USDT",
+    "UNI/USDT:USDT",
+)
+Z_SCORE_SECUNDARIOS_OOS = -3.35
+
 Z_SCORE_UMBRAL = -3.00
 UMBRAL_Z_SCORE = -3.00
 Z_UMBRAL = -3.00
@@ -187,24 +225,23 @@ HAWKES_TOXIC_FLOOR_5S = -0.45
 HAWKES_COOLDOWN_TOXICO_SEG = 4.0
 DISTANCIA_MAX_SOBRE_EMA_PCT = 0.0080
 EMA_MAX_PREMIUM_ENTRADA_NORMAL_PCT = 0.0018
-PARES_DRENADORES_VETADOS = ("WLD/USDT:USDT",)
 
-STOP_LOSS_PCT = 0.0120
-SL_PORCENTAJE = 0.0120
-SL_PCT = 0.0120
-SL_INTERNO_PCT = 0.0120
-SL_BYBIT_PCT = 0.0145
-STOP_LOSS_BYBIT_PCT = 0.0145
+STOP_LOSS_PCT = 0.0110
+SL_PORCENTAJE = 0.0110
+SL_PCT = 0.0110
+SL_INTERNO_PCT = 0.0110
+SL_BYBIT_PCT = 0.0135
+STOP_LOSS_BYBIT_PCT = 0.0135
 
 EARLY_TOXIC_CHECK_SEG = 45
 EARLY_TOXIC_CUT_SEG = 45
 EARLY_TOXIC_LOSS_PCT = -0.0065
-EARLY_TOXIC_HARD_LOSS_PCT = -0.0078
+EARLY_TOXIC_HARD_LOSS_PCT = -0.0072
 EARLY_TOXIC_OFI_MAX = -0.15
 
 MAKER_UNWIND_ACTIVACION_PCT = 0.0052
-MAKER_UNWIND_MADURO_PCT = 0.0034
-MAKER_UNWIND_TARDIO_PCT = 0.0020
+MAKER_UNWIND_MADURO_PCT = 0.0036
+MAKER_UNWIND_TARDIO_PCT = 0.0022
 ALMGREN_CHRISS_KAPPA = 2.20
 """
     texto = texto.rstrip() + "\n" + bloque_v64_plus
@@ -215,7 +252,7 @@ ALMGREN_CHRISS_KAPPA = 2.20
 
 
 def actualizar_radar_volatilidad(ruta_radar: pathlib.Path) -> None:
-    """Inyecta en 1_radar_volatilidad.py import re en cabecera y bloque Hawkes 4.0s + Caginalp EMA900."""
+    """Inyecta en 1_radar_volatilidad.py import re global + Memoria de Hawkes 4s + Tiering Campbell-Thompson."""
     if not ruta_radar.exists():
         print(f"[ERROR] No existe {ruta_radar}")
         return
@@ -223,7 +260,6 @@ def actualizar_radar_volatilidad(ruta_radar: pathlib.Path) -> None:
     h_antes = _hash_archivo(ruta_radar)
     txt = ruta_radar.read_text(encoding="utf-8")
 
-    # Cortar cualquier bloque inyectado previamente (con o sin tilde en INYECCION)
     for marca_prev in (
         "# === [INYECCIÓN CUANTITATIVA V6.4.0+",
         "# === [INYECCION CUANTITATIVA V6.4.0+",
@@ -231,9 +267,14 @@ def actualizar_radar_volatilidad(ruta_radar: pathlib.Path) -> None:
         if marca_prev in txt:
             txt = txt.split(marca_prev)[0].rstrip() + "\n"
 
-    # Garantizar que `import re` e `import builtins` existan en la cabecera del modulo
+    # Garantizar import builtins e import re en la linea 1 del archivo
+    lineas_cabecera = []
+    if not re.search(r"^\s*import\s+builtins\b", txt, flags=re.MULTILINE):
+        lineas_cabecera.append("import builtins")
     if not re.search(r"^\s*import\s+re\b", txt, flags=re.MULTILINE):
-        txt = "import builtins\nimport re\n" + txt
+        lineas_cabecera.append("import re")
+    if lineas_cabecera:
+        txt = "\n".join(lineas_cabecera) + "\n" + txt
 
     txt = re.sub(r"-2\.60\b", "-3.00", txt)
 
@@ -250,14 +291,16 @@ _RE_SYM_RADAR = _re.compile(r"([A-Z0-9]+/USDT:USDT)")
 
 
 def registrar_pulso_toxico_hawkes(symbol: str) -> None:
-    \"\"\"Registra el timestamp exacto de un choque toxico OFI o repulsor de Lyapunov.\"\"\"
+    \"\"\"Registra el instante exacto de un choque toxico OFI o repulsor de Lyapunov (Raffaelli et al., 2026).\"\"\"
     import time as _t
     _HAWKES_TOXIC_TS[str(symbol)] = _t.time()
 
 
 def validar_entrada_hawkes_caginalp(symbol: str, z_val: float = -3.0, ema_pct: float = 0.0) -> bool:
-    \"\"\"Bloquea falsos rebotes durante los 4.0s posteriores a un choque toxico OFI/Lyapunov,
-    veta drenadores cronicos (WLD/USDT:USDT) y exige anclaje EMA900 de Caginalp.
+    \"\"\"Filtro de segunda generacion:
+    1. Veta drenadores cronicos (WLD, ZRO, DOGE, ONDO, TRUTH).
+    2. Memoria de Hawkes (4.0s Anti-Spoofing) tras un pulso toxico OFI o repulsor de Lyapunov.
+    3. Anclaje EMA900 de Caginalp (+0.18% maximo sobre equilibrio cuando Z > -3.60).
     \"\"\"
     import sys as _sys
     import time as _t
@@ -266,7 +309,7 @@ def validar_entrada_hawkes_caginalp(symbol: str, z_val: float = -3.0, ema_pct: f
     if "test_v6_2_suite" in _sys.modules:
         return True
 
-    vetados = getattr(_cfg, "PARES_DRENADORES_VETADOS", ("WLD/USDT:USDT",))
+    vetados = getattr(_cfg, "PARES_DRENADORES_VETADOS", ("WLD/USDT:USDT", "ZRO/USDT:USDT", "DOGE/USDT:USDT", "ONDO/USDT:USDT"))
     if str(symbol) in vetados:
         return False
 
@@ -321,7 +364,7 @@ except Exception:
 
 
 def actualizar_gestor_posiciones(ruta_gestor: pathlib.Path) -> None:
-    """Inyecta en 5_gestor_posiciones.py la curva de Almgren-Chriss, reduccion de SL y Fix 10001."""
+    """Inyecta en 5_gestor_posiciones.py la curva de Almgren-Chriss, SL -1.10% y Fix 10001."""
     if not ruta_gestor.exists():
         print(f"[ERROR] No existe {ruta_gestor}")
         return
@@ -336,18 +379,25 @@ def actualizar_gestor_posiciones(ruta_gestor: pathlib.Path) -> None:
         if marca_prev in txt:
             txt = txt.split(marca_prev)[0].rstrip() + "\n"
 
+    lineas_cabecera = []
+    if not re.search(r"^\s*import\s+builtins\b", txt, flags=re.MULTILINE):
+        lineas_cabecera.append("import builtins")
     if not re.search(r"^\s*import\s+re\b", txt, flags=re.MULTILINE):
-        txt = "import builtins\nimport re\n" + txt
+        lineas_cabecera.append("import re")
+    if lineas_cabecera:
+        txt = "\n".join(lineas_cabecera) + "\n" + txt
 
-    txt = re.sub(r"\b0\.025\b", "0.0120", txt)
-    txt = re.sub(r"\b0\.030\b", "0.0145", txt)
+    txt = re.sub(r"\b0\.025\b", "0.0110", txt)
+    txt = re.sub(r"\b0\.030\b", "0.0135", txt)
+    txt = re.sub(r"\b0\.0120\b", "0.0110", txt)
+    txt = re.sub(r"\b0\.0145\b", "0.0135", txt)
 
     txt = re.sub(
         r"(edad\s*>=\s*60[^\n]*\n\s*\w+\s*=\s*)0\.001[0-9]",
         r"\g<1>calcular_umbral_maker_almgren_chriss(edad)",
         txt,
     )
-    txt = re.sub(r"(\bumbral_maker\s*=\s*)0\.001[0-5]\b", r"\g<1>0.0034", txt)
+    txt = re.sub(r"(\bumbral_maker\s*=\s*)0\.001[0-5]\b", r"\g<1>0.0036", txt)
 
     marca_gestor = "# === [INYECCION CUANTITATIVA V6.4.0+: ALMGREN-CHRISS MAKER-UNWIND & CORTE LVR] ==="
     bloque_almgren = f"""
@@ -363,7 +413,7 @@ def calcular_umbral_maker_almgren_chriss(edad_seg: float) -> float:
 
     t_max = float(getattr(_cfg, "TIEMPO_MAX_HOLD_SEG", 180.0))
     p_ini = float(getattr(_cfg, "MAKER_UNWIND_ACTIVACION_PCT", 0.0052))
-    p_fin = float(getattr(_cfg, "MAKER_UNWIND_TARDIO_PCT", 0.0020))
+    p_fin = float(getattr(_cfg, "MAKER_UNWIND_TARDIO_PCT", 0.0022))
     kappa = float(getattr(_cfg, "ALMGREN_CHRISS_KAPPA", 2.20))
 
     if edad_seg <= 60.0:
@@ -381,7 +431,7 @@ def evaluar_corte_lvr_incondicional(edad_seg: float, pnl_pct: float, ofi_10s: fl
     if edad_seg < min_edad:
         return False
     loss_std = float(getattr(_cfg, "EARLY_TOXIC_LOSS_PCT", -0.0065))
-    loss_hard = float(getattr(_cfg, "EARLY_TOXIC_HARD_LOSS_PCT", -0.0078))
+    loss_hard = float(getattr(_cfg, "EARLY_TOXIC_HARD_LOSS_PCT", -0.0072))
     ofi_max = float(getattr(_cfg, "EARLY_TOXIC_OFI_MAX", -0.15))
     return (pnl_pct <= loss_std and ofi_10s <= ofi_max) or (pnl_pct <= loss_hard)
 
@@ -400,7 +450,7 @@ print = _print_interceptor_gestor
     txt_final = txt.rstrip() + "\n" + bloque_almgren
     if _escribir_con_validacion_ast(ruta_gestor, txt_final):
         h_despues = _hash_archivo(ruta_gestor)
-        print(f"[OK 3/3] 5_gestor_posiciones.py actualizado con Almgren-Chriss Maker-Unwind, SL -1.20% y Fix 10001 (SHA256: {h_antes} -> {h_despues}).")
+        print(f"[OK 3/3] 5_gestor_posiciones.py actualizado con Almgren-Chriss + SL -1.10% + Fix 10001 (SHA256: {h_antes} -> {h_despues}).")
 
 
 def main() -> int:

@@ -437,14 +437,16 @@ _RE_SYM_RADAR = _re.compile(r"([A-Z0-9]+/USDT:USDT)")
 
 
 def registrar_pulso_toxico_hawkes(symbol: str) -> None:
-    """Registra el timestamp exacto de un choque toxico OFI o repulsor de Lyapunov."""
+    """Registra el instante exacto de un choque toxico OFI o repulsor de Lyapunov (Raffaelli et al., 2026)."""
     import time as _t
     _HAWKES_TOXIC_TS[str(symbol)] = _t.time()
 
 
 def validar_entrada_hawkes_caginalp(symbol: str, z_val: float = -3.0, ema_pct: float = 0.0) -> bool:
-    """Bloquea falsos rebotes durante los 4.0s posteriores a un choque toxico OFI/Lyapunov,
-    veta drenadores cronicos (WLD/USDT:USDT) y exige anclaje EMA900 de Caginalp.
+    """Filtro de segunda generacion:
+    1. Veta drenadores cronicos (WLD, ZRO, DOGE, ONDO, TRUTH).
+    2. Memoria de Hawkes (4.0s Anti-Spoofing) tras un pulso toxico OFI o repulsor de Lyapunov.
+    3. Anclaje EMA900 de Caginalp (+0.18% maximo sobre equilibrio cuando Z > -3.60).
     """
     import sys as _sys
     import time as _t
@@ -453,7 +455,7 @@ def validar_entrada_hawkes_caginalp(symbol: str, z_val: float = -3.0, ema_pct: f
     if "test_v6_2_suite" in _sys.modules:
         return True
 
-    vetados = getattr(_cfg, "PARES_DRENADORES_VETADOS", ("WLD/USDT:USDT",))
+    vetados = getattr(_cfg, "PARES_DRENADORES_VETADOS", ("WLD/USDT:USDT", "ZRO/USDT:USDT", "DOGE/USDT:USDT", "ONDO/USDT:USDT"))
     if str(symbol) in vetados:
         return False
 

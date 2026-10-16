@@ -684,7 +684,7 @@ def calcular_umbral_maker_almgren_chriss(edad_seg: float) -> float:
 
     t_max = float(getattr(_cfg, "TIEMPO_MAX_HOLD_SEG", 180.0))
     p_ini = float(getattr(_cfg, "MAKER_UNWIND_ACTIVACION_PCT", 0.0052))
-    p_fin = float(getattr(_cfg, "MAKER_UNWIND_TARDIO_PCT", 0.0020))
+    p_fin = float(getattr(_cfg, "MAKER_UNWIND_TARDIO_PCT", 0.0022))
     kappa = float(getattr(_cfg, "ALMGREN_CHRISS_KAPPA", 2.20))
 
     if edad_seg <= 60.0:
@@ -702,7 +702,7 @@ def evaluar_corte_lvr_incondicional(edad_seg: float, pnl_pct: float, ofi_10s: fl
     if edad_seg < min_edad:
         return False
     loss_std = float(getattr(_cfg, "EARLY_TOXIC_LOSS_PCT", -0.0065))
-    loss_hard = float(getattr(_cfg, "EARLY_TOXIC_HARD_LOSS_PCT", -0.0078))
+    loss_hard = float(getattr(_cfg, "EARLY_TOXIC_HARD_LOSS_PCT", -0.0072))
     ofi_max = float(getattr(_cfg, "EARLY_TOXIC_OFI_MAX", -0.15))
     return (pnl_pct <= loss_std and ofi_10s <= ofi_max) or (pnl_pct <= loss_hard)
 
