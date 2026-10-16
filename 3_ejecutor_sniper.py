@@ -1,8 +1,10 @@
 """Ejecutor Sniper SPLITBRAIN V6.4.2:
-- Zero-REST Critical Path y Cerrojo Nativo Single-Slot Mutex (MAX_POSICIONES_SIMULTANEAS = 1).
-- Re-Cotización Inteligente PostOnly de 1 Salto a los 3.5s (Queue-Position & Drift Valuation).
-- Cotización Discreta de Bertrand (Penny-Jump Best-Bid + 1 Tick) y Warm-Socket Keep-Alive.
-- Jerarquía Correcta de Stop-Loss en Servidor Bybit (SL_BYBIT_PCT = 1.65% catastrófico).
+- Zero-REST Critical Path y Cerrojo Nativo Single-Slot Mutex (MAX_POSICIONES_SIMULTANEAS = 1)[cite: 64].
+- Dimensionamiento Estocástico de Capital: Kelly con Restricción Convexa de Drawdown (Busseti, Ryu & Boyd)
+  en [0.25, 0.42] + Escalado Inverso por Volatilidad Realizada (Target-Sigma de SYMBA).
+- Re-Cotización Inteligente PostOnly de 1 Salto a los 3.5s (Queue-Position & Drift Valuation)[cite: 64].
+- Cotización Discreta de Bertrand (Penny-Jump Best-Bid + 1 Tick) y Warm-Socket Keep-Alive[cite: 64].
+- Jerarquía Correcta de Stop-Loss en Servidor Bybit (SL_BYBIT_PCT = 1.65% catastrófico)[cite: 64].
 """
 import asyncio
 import importlib
@@ -41,7 +43,7 @@ _SALDO_FALLBACK_TTL_SEG = 2.0
 
 
 def _lanzar_bg(coro) -> asyncio.Task:
-    """Ejecuta una corutina en modo Fire-and-Forget protegiendo su referencia contra el GC."""
+    """Ejecuta una corutina en modo Fire-and-Forget protegiendo su referencia contra el GC[cite: 64]."""
     tarea = asyncio.create_task(coro)
     _tareas_bg.add(tarea)
     tarea.add_done_callback(_tareas_bg.discard)
@@ -49,12 +51,12 @@ def _lanzar_bg(coro) -> asyncio.Task:
 
 
 def enviar_alerta_bg(mensaje: str) -> None:
-    """Despacha alerta a Telegram en background (0 ms de bloqueo en ruta crítica)."""
+    """Despacha alerta a Telegram en background (0 ms de bloqueo en ruta crítica)[cite: 64]."""
     _lanzar_bg(enviar_alerta(mensaje))
 
 
 async def sincronizar_saldo_ram(exchange) -> float:
-    """Actualiza el caché de margen libre USDT en RAM consultando Bybit fuera de ruta crítica."""
+    """Actualiza el caché de margen libre USDT en RAM consultando Bybit fuera de ruta crítica[cite: 64]."""
     global _saldo_libre_ram, _saldo_ts
     if cfg.MODO_PAPER or exchange is None:
         _saldo_libre_ram = float(cfg.CAPITAL_BASE_USDT)
@@ -72,13 +74,13 @@ async def sincronizar_saldo_ram(exchange) -> float:
 
 
 def disparar_sincronizacion_saldo_bg(exchange) -> None:
-    """Programa una reconciliación asíncrona del saldo libre en RAM sin bloquear el loop."""
+    """Programa una reconciliación asíncrona del saldo libre en RAM sin bloquear el loop[cite: 64]."""
     if not cfg.MODO_PAPER and exchange is not None:
         _lanzar_bg(sincronizar_saldo_ram(exchange))
 
 
 async def bucle_keepalive_socket(exchange) -> None:
-    """Warm-Socket Keep-Alive: refresca la sesión HTTP/TLS privada y el caché `_saldo_libre_ram` cada 45s."""
+    """Warm-Socket Keep-Alive: refresca la sesión HTTP/TLS privada y el caché `_saldo_libre_ram` cada 45s[cite: 64]."""
     intervalo = float(getattr(cfg, "KEEPALIVE_SOCKET_SEG", 45.0))
     while True:
         await asyncio.sleep(intervalo)
@@ -94,7 +96,7 @@ async def bucle_keepalive_socket(exchange) -> None:
 
 
 async def precalentar_apalancamiento_universo(exchange, simbolos: Iterable[str]) -> None:
-    """Pre-configura el apalancamiento en el arranque para evitar llamadas REST en el disparo."""
+    """Pre-configura el apalancamiento en el arranque para evitar llamadas REST en el disparo[cite: 64]."""
     if cfg.MODO_PAPER:
         for s in simbolos:
             _apalancamiento_ok.add(s)
@@ -111,12 +113,12 @@ async def precalentar_apalancamiento_universo(exchange, simbolos: Iterable[str])
 
 
 def posicion_activa(symbol: str) -> bool:
-    """True si el par tiene una compra en curso o una posición gestionada."""
+    """True si el par tiene una compra en curso o una posición gestionada[cite: 64]."""
     return symbol in _en_vuelo or _gestor_mod.gestor.tiene(symbol)
 
 
 def total_posiciones_activas() -> int:
-    """Cuenta el total de símbolos con orden en vuelo o posición viva en el gestor."""
+    """Cuenta el total de símbolos con orden en vuelo o posición viva en el gestor[cite: 64]."""
     activos = set(_en_vuelo)
     for sym, pos in list(_gestor_mod.gestor.posiciones.items()):
         if not getattr(pos, "cerrada", False):
@@ -125,7 +127,7 @@ def total_posiciones_activas() -> int:
 
 
 def cupo_portafolio_disponible() -> bool:
-    """Garantiza estricto cumplimiento de MAX_POSICIONES_SIMULTANEAS (1) para evitar solapamientos."""
+    """Garantiza estricto cumplimiento de MAX_POSICIONES_SIMULTANEAS (1) para evitar solapamientos[cite: 64]."""
     if "test_v6_2_suite" in sys.modules:
         return True
     max_pos = int(getattr(cfg, "MAX_POSICIONES_SIMULTANEAS", getattr(cfg, "MAX_POSICIONES", 1)))
@@ -133,7 +135,7 @@ def cupo_portafolio_disponible() -> bool:
 
 
 def en_cooldown_post_cierre(symbol: str) -> bool:
-    """True si el símbolo se encuentra en cuarentena tras haber cerrado una posición."""
+    """True si el símbolo se encuentra en cuarentena tras haber cerrado una posición[cite: 64]."""
     return _gestor_mod.gestor.en_cooldown(symbol)
 
 
@@ -142,7 +144,7 @@ def _d(x) -> Decimal:
 
 
 def cuantizar_orden(exchange, symbol: str, nocional: float, precio: float) -> Optional[tuple[str, str]]:
-    """Smart quantization: cantidad = floor(nocional / precio) al step_size; precio con floor al tick_size."""
+    """Smart quantization: cantidad = floor(nocional / precio) al step_size; precio con floor al tick_size[cite: 64]."""
     m = exchange.market(symbol)
     step = _d(m["precision"]["amount"])
     tick = _d(m["precision"]["price"])
@@ -165,7 +167,7 @@ def cuantizar_orden(exchange, symbol: str, nocional: float, precio: float) -> Op
 
 
 def _es_error_blacklist(e: Exception) -> bool:
-    """Errores de permiso por símbolo (acuerdo sin firmar, compliance, whitelist)."""
+    """Errores de permiso por símbolo (acuerdo sin firmar, compliance, whitelist)[cite: 64]."""
     texto = str(e)
     return bool(_RE_BLACKLIST.search(texto)) or "agreement" in texto.lower()
 
@@ -184,7 +186,7 @@ async def _fijar_apalancamiento(exchange, symbol: str) -> None:
 def _extraer_precio_maker_ws(
     exchange, symbol: str, ticker_ws: Optional[dict], ofi: Optional[float] = None
 ) -> Optional[float]:
-    """Cotización Discreta de Bertrand (Best-Bid & Penny-Jump)."""
+    """Cotización Discreta de Bertrand (Best-Bid & Penny-Jump)[cite: 64]."""
     t = ticker_ws
     if not t and hasattr(exchange, "tickers") and isinstance(exchange.tickers, dict):
         t = exchange.tickers.get(symbol)
@@ -223,11 +225,21 @@ def _extraer_precio_maker_ws(
 
 def _obtener_sl_bybit_pct() -> float:
     """Devuelve el porcentaje de Stop-Loss catastrófico alojado en Bybit (~1.65%),
-    garantizando que jamás sea más estrecho que el SL interno (~1.15%).
+    garantizando que jamás sea más estrecho que el SL interno (~1.15%)[cite: 64].
     """
     sl_int = min(float(getattr(cfg, "SL_INTERNO_PCT", getattr(cfg, "SL_INICIAL_PCT", 0.0115))), 0.0125)
     sl_exc = float(getattr(cfg, "SL_BYBIT_PCT", getattr(cfg, "STOP_LOSS_BYBIT_PCT", getattr(cfg, "SL_PCT", 0.0165))))
     return max(sl_exc, sl_int + 0.0040, 0.0155)
+
+
+def _calcular_kelly_operativo(symbol: str, sigma_rel: Optional[float], saldo_libre: float) -> float:
+    """Obtiene en O(1) la fracción de Kelly dinámica (Busseti-Ryu-Boyd + Target-Sigma) desde StatsTracker."""
+    if hasattr(_stats, "tracker") and hasattr(_stats.tracker, "calcular_kelly_dinamico"):
+        try:
+            return float(_stats.tracker.calcular_kelly_dinamico(symbol=symbol, sigma_rel=sigma_rel, saldo_libre=saldo_libre))
+        except Exception:
+            pass
+    return float(getattr(cfg, "KELLY_MAX_PCT", 0.35))
 
 
 async def ejecutar_orden_sniper(
@@ -270,19 +282,21 @@ async def ejecutar_orden_sniper(
 
         t_disparo_ns = time.perf_counter_ns()
         try:
-            # 0. Mercados ya cargados en main.py (O(1) en RAM); solo carga si el dict está vacío
+            # 0. Mercados ya cargados en main.py (O(1) en RAM); solo carga si el dict está vacío[cite: 64]
             if not getattr(exchange, "markets", None):
                 await exchange.load_markets()
 
-            # 1. Lectura de Saldo Libre O(1) en RAM (Cero REST en ruta crítica)
+            # 1. Lectura de Saldo Libre O(1) en RAM y Fracción de Kelly Dinámica BRB + Target-Sigma
             if _saldo_libre_ram is None:
                 await sincronizar_saldo_ram(exchange)
             libre = float(_saldo_libre_ram or 0.0)
-            inversion = libre * cfg.KELLY_MAX_PCT
+            kelly_eff = _calcular_kelly_operativo(symbol, sigma_rel, libre)
+            inversion = libre * kelly_eff
 
             if inversion < MIN_INVERSION_USDT and (time.time() - _saldo_ts) >= _SALDO_FALLBACK_TTL_SEG:
                 libre = await sincronizar_saldo_ram(exchange)
-                inversion = libre * cfg.KELLY_MAX_PCT
+                kelly_eff = _calcular_kelly_operativo(symbol, sigma_rel, libre)
+                inversion = libre * kelly_eff
 
             if inversion < MIN_INVERSION_USDT:
                 print(
@@ -292,14 +306,14 @@ async def ejecutar_orden_sniper(
                 return
             nocional = inversion * cfg.APALANCAMIENTO
 
-            # 2. Precio de disparo desde WebSocket con lógica Best-Bid / Penny-Jump O(1)
+            # 2. Precio de disparo desde WebSocket con lógica Best-Bid / Penny-Jump O(1)[cite: 64]
             precio_ref = _extraer_precio_maker_ws(exchange, symbol, ticker, ofi=ofi)
             if precio_ref is None:
                 t_rest = await exchange.fetch_ticker(symbol)
                 last, bid = t_rest.get("last"), t_rest.get("bid")
                 precio_ref = float(min(last, bid) if (bid and last) else (bid or last))
 
-            # 3. Smart quantization O(1) en CPU
+            # 3. Smart quantization O(1) en CPU[cite: 64]
             cuantizado = cuantizar_orden(exchange, symbol, nocional, precio_ref)
             if cuantizado is None:
                 return
@@ -307,13 +321,13 @@ async def ejecutar_orden_sniper(
             sl_bybit_pct = _obtener_sl_bybit_pct()
             precio_sl = exchange.price_to_precision(symbol, float(price) * (1.0 - sl_bybit_pct))
 
-            # 4. Apalancamiento O(1) (pre-calentado) + Única llamada de red: create_order
+            # 4. Apalancamiento O(1) (pre-calentado) + Única llamada de red: create_order[cite: 64]
             await _fijar_apalancamiento(exchange, symbol)
             params = {"timeInForce": "PostOnly", "stopLoss": str(precio_sl)}
             orden = await exchange.create_order(symbol, "limit", "buy", amount, price, params)
             _en_vuelo.add(symbol)
 
-            # Descuento inmediato en RAM para evitar sobre-disparo en ráfagas simultáneas
+            # Descuento inmediato en RAM para evitar sobre-disparo en ráfagas simultáneas[cite: 64]
             margen_comprometido = (float(amount) * float(price)) / float(cfg.APALANCAMIENTO)
             _saldo_libre_ram = max(0.0, libre - margen_comprometido)
             disparar_sincronizacion_saldo_bg(exchange)
@@ -328,7 +342,7 @@ async def ejecutar_orden_sniper(
 
     lat_orden_ms = (time.perf_counter_ns() - t_disparo_ns) / 1_000_000.0
 
-    # 5. PRIORIDAD ABSOLUTA: Iniciar vigilancia de la orden ANTES de enviar telemetría a Telegram
+    # 5. PRIORIDAD ABSOLUTA: Iniciar vigilancia de la orden ANTES de enviar telemetría a Telegram[cite: 64]
     if cfg.MOTOR_SALIDA == "AS":
         tarea = asyncio.create_task(
             motor_salida_avellaneda_stoikov(
@@ -345,7 +359,7 @@ async def ejecutar_orden_sniper(
 
     print(
         f"[FRANCOTIRADOR] Orden {orden['id']} en {symbol}: {amount} @ {price} "
-        f"(nocional ~{float(amount) * float(price):.2f} USDT, {cfg.APALANCAMIENTO}x, "
+        f"(nocional ~{float(amount) * float(price):.2f} USDT, {cfg.APALANCAMIENTO}x, Kelly={kelly_eff:.0%}, "
         f"Z={z_score:.2f}, OFI={ofi if ofi is None else round(ofi, 2)}, RTT={lat_orden_ms:.1f}ms)"
     )
     enviar_alerta_bg(
@@ -362,7 +376,7 @@ async def _entregar_al_gestor(
     ofi: Optional[float],
     nocional: Optional[float] = None,
 ) -> None:
-    """Espera el llenado real de la compra (con Re-Quote inteligente a los 3.5s) y entrega la posición al gestor."""
+    """Espera el llenado real de la compra (con Re-Quote inteligente a los 3.5s) y entrega la posición al gestor[cite: 64]."""
     try:
         llenado, medio = await _esperar_llenado_detalle(
             exchange,
@@ -390,7 +404,7 @@ async def _estado_orden(exchange, order_id: str, symbol: str) -> dict:
 
 
 async def _posicion_larga(exchange, symbol: str) -> Optional[float]:
-    """Tamaño de la posición larga abierta (0 si no hay). None si la API falla."""
+    """Tamaño de la posición larga abierta (0 si no hay). None si la API falla[cite: 64]."""
     try:
         posiciones = await exchange.fetch_positions([symbol])
     except Exception as e:
@@ -412,7 +426,7 @@ async def _intentar_requote_postonly(
 ) -> Optional[tuple[str, float]]:
     """Re-Cotización Inteligente de 1 Salto (Queue-Position & Drift Valuation):
     Si el precio subió entre 1 tick y +0.22% durante el vuelo y persiste absorción compradora,
-    coloca 1 nueva orden Limit Buy PostOnly en el nuevo best_bid.
+    coloca 1 nueva orden Limit Buy PostOnly en el nuevo best_bid[cite: 64].
     """
     if "test_v6_2_suite" in sys.modules:
         return None
@@ -482,7 +496,7 @@ async def _esperar_llenado_detalle(
     nocional: Optional[float] = None,
     ofi_entry: Optional[float] = None,
 ) -> tuple[float, Optional[float]]:
-    """(cantidad realmente comprada, precio medio). Incluye 1 Re-Quote inteligente a los 3.5s si no llenó."""
+    """(cantidad realmente comprada, precio medio). Incluye 1 Re-Quote inteligente a los 3.5s si no llenó[cite: 64]."""
     def _resultado(o: dict) -> tuple[float, Optional[float]]:
         medio = o.get("average") or o.get("price")
         return float(o.get("filled") or 0), (float(medio) if medio else None)
@@ -508,7 +522,7 @@ async def _esperar_llenado_detalle(
         if st == "closed":
             return _resultado(o)
 
-        # Si Bybit canceló/rechazó la orden PostOnly al vuelo o cumplimos 3.5s con 0 llenado, evaluar 1 Re-Quote
+        # Si Bybit canceló/rechazó la orden PostOnly al vuelo o cumplimos 3.5s con 0 llenado, evaluar 1 Re-Quote[cite: 64]
         edad_orden = time.time() - t_inicio
         if st in ("canceled", "rejected", "expired"):
             if filled_now > 0:
@@ -529,7 +543,7 @@ async def _esperar_llenado_detalle(
             and nocional_base > 0
             and "test_v6_2_suite" not in sys.modules
         ):
-            # Verificar si el best_bid se alejó hacia arriba antes de cancelar la orden original
+            # Verificar si el best_bid se alejó hacia arriba antes de cancelar la orden original[cite: 64]
             t_ws = exchange.tickers.get(symbol) if hasattr(exchange, "tickers") and isinstance(exchange.tickers, dict) else None
             bid_ws = float((t_ws or {}).get("bid") or 0.0)
             if bid_ws > precio_base and ((bid_ws - precio_base) / precio_base) <= REQUOTE_MAX_DRIFT_PCT:
@@ -563,7 +577,7 @@ async def _esperar_llenado_detalle(
 
 
 async def _esperar_llenado_compra(exchange, symbol: str, id_compra: str) -> float:
-    """Devuelve la cantidad realmente comprada (0 si no se llenó). Cancela el resto al expirar."""
+    """Devuelve la cantidad realmente comprada (0 si no se llenó). Cancela el resto al expirar[cite: 64]."""
     return (await _esperar_llenado_detalle(exchange, symbol, id_compra))[0]
 
 
@@ -575,7 +589,7 @@ def calcular_precio_salida_hjb_as(
     t_restante: float,
     t_total: float,
 ) -> float:
-    """Ecuación HJB de Avellaneda-Stoikov (2008) para liquidación pasiva de inventario."""
+    """Ecuación HJB de Avellaneda-Stoikov (2008) para liquidación pasiva de inventario[cite: 64]."""
     gamma = float(getattr(cfg, "GAMMA_AS", 0.05))
     kappa = float(getattr(cfg, "KAPPA_AS", 1.5))
     tau = max(0.0, min(1.0, t_restante / max(t_total, 1.0)))
@@ -601,7 +615,7 @@ async def _registrar_cierre_as(
     ofi: Optional[float],
     es_maker_salida: bool,
 ) -> None:
-    """Registra las operaciones del motor AS en la Caja Negra, activa Cooldown Post-Cierre y refresca RAM."""
+    """Registra las operaciones del motor AS en la Caja Negra, activa Cooldown Post-Cierre y refresca RAM[cite: 64]."""
     try:
         _gestor_mod.gestor.registrar_cooldown_post_cierre(symbol)
         fee_out = cfg.FEE_MAKER if es_maker_salida else cfg.FEE_TAKER
