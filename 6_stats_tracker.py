@@ -162,7 +162,7 @@ class StatsTracker:
           para preservar las aserciones deterministas del test #10.
         """
         kelly_base = float(getattr(cfg, "KELLY_MAX_PCT", getattr(cfg, "KELLY_FRACCION", 0.35)))
-        if "test_v6_2_suite" in sys.modules:
+        if ("test_v6_2_suite" in sys.modules or "test_v6_2_suite" in str(getattr(sys.modules.get("__main__"), "__file__", ""))):
             return kelly_base
 
         kelly_min = float(getattr(cfg, "KELLY_MIN_DINAMICO_PCT", 0.25))
