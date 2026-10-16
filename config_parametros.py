@@ -336,7 +336,7 @@ MAKER_UNWIND_STALL_SEG = 65
 MAKER_UNWIND_MIN_PNL_PCT = 0.0012
 MAKER_UNWIND_OFI_TECHO = 0.18
 MAKER_PERSISTENCIA_SEG = 12.0
-SL_INICIAL_PCT = 0.0115
+SL_INICIAL_PCT = 0.0088
 BE_PISO_EXCHANGE_PCT = 0.001
 OFI_SALIDA_EMERGENCIA = -0.42
 OFI_SALIDA_MIN_LOSS_PCT = -0.0025
@@ -413,7 +413,7 @@ EMA_MAX_PREMIUM_ENTRADA_NORMAL_PCT = 0.0015
 # - SL Bybit (Servidor): -1.65% (respaldo catastrofico; evita cierres SL_EXCHANGE en 10s)
 STOP_LOSS_PCT = 0.0115
 SL_PORCENTAJE = 0.0115
-SL_PCT = 0.0115
+SL_PCT = 0.0122
 SL_INTERNO_PCT = 0.0115
 SL_BYBIT_PCT = 0.0165
 STOP_LOSS_BYBIT_PCT = 0.0165
@@ -467,3 +467,62 @@ REQUOTE_TRIGGER_SEG = 2.0
 REQUOTE_MAX_DRIFT_PCT = 0.0028
 REQUOTE_MIN_OFI = 0.30
 BLACKLIST_PAIRS.add("AAVE/USDT:USDT")
+
+# ==============================================================================
+# CALIBRACION SHAPLEY ELITE V6.4.4 (REPLICATOR DYNAMICS + WAL #1 + SL -0.88%/-1.22%)
+# ==============================================================================
+UNIVERSO_SHAPLEY_ELITE = [
+    "WAL/USDT:USDT",
+    "ZEREBRO/USDT:USDT",
+    "INJ/USDT:USDT",
+    "XRP/USDT:USDT",
+    "STRK/USDT:USDT",
+    "AVAX/USDT:USDT",
+    "1000PEPE/USDT:USDT",
+    "HYPE/USDT:USDT",
+    "TIA/USDT:USDT",
+    "ARB/USDT:USDT",
+]
+
+PARES_NUCLEO_ALFA = (
+    "WAL/USDT:USDT",
+    "ZEREBRO/USDT:USDT",
+    "INJ/USDT:USDT",
+    "XRP/USDT:USDT",
+    "STRK/USDT:USDT",
+    "AVAX/USDT:USDT",
+    "1000PEPE/USDT:USDT",
+    "HYPE/USDT:USDT",
+    "TIA/USDT:USDT",
+)
+
+# Pares con Esperanza E_i < 0 demostrada en los 276 trades (-0.5619 USDT en secundarios + -0.8267 USDT en drenadores)
+PARES_DRENADORES_VETADOS = (
+    "WLD/USDT:USDT",
+    "ZRO/USDT:USDT",
+    "DOGE/USDT:USDT",
+    "ONDO/USDT:USDT",
+    "TRUTH/USDT:USDT",
+    "PUMPFUN/USDT:USDT",
+    "NEAR/USDT:USDT",
+    "ADA/USDT:USDT",
+    "ENA/USDT:USDT",
+    "UNI/USDT:USDT",
+    "AAVE/USDT:USDT",
+    "TAO/USDT:USDT",
+)
+
+Z_SCORE_NUCLEO_ALFA = -2.85
+Z_SCORE_SECUNDARIOS_OOS = -3.20
+
+# Jerarquía de Stop-Loss calibrada para evitar pérdidas de -0.185 USDT:
+# - SL Interno = -0.88% (con ventana de gracia de 6.0s contra ruido inicial menor a -1.08%)
+# - SL Bybit   = -1.22% (respaldo en servidor)
+SL_INICIAL_PCT = 0.0088
+SL_INTERNO_PCT = 0.0088
+STOP_LOSS_PCT = 0.0088
+SL_PCT = 0.0122
+SL_BYBIT_PCT = 0.0122
+STOP_LOSS_BYBIT_PCT = 0.0122
+BYBIT_SL_PCT = 0.0122
+SL_GRACIA_MECHAZO_SEG = 6.0

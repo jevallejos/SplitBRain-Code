@@ -1,6 +1,6 @@
 # DOSSIER MAESTRO DE INGENIERÍA Y RESUMEN EJECUTIVO CONSOLIDADO — SPLITBRAIN-ARGON V6.4.2 (BASE PARA OMEGA V7.0)
 
-- **Fecha de Compilación Automática (Antigravity IDE)**: `2026-10-16 20:08:01 UTC`
+- **Fecha de Compilación Automática (Antigravity IDE)**: `2026-10-16 21:26:45 UTC`
 - **Repositorio Oficial**: `https://github.com/jevallejos/SplitBRain-Code.git`
 - **Nodo de Producción**: `sniper-tokio` (`asia-northeast1`, GCP) — Bybit V5 Perpetuals USDT (UTA)
 - **Pipeline de Despliegue Inmutable**: `Google Antigravity IDE (D:\dev\SplitBRain-Code) -> GitHub (origin/main) -> sniper-tokio`
@@ -36,7 +36,7 @@
 
 | Módulo | Líneas | SHA-256 Actual | Rol Arquitectónico en `SplitBrain-Argon v6.4.2` |
 | :--- | :---: | :---: | :--- |
-| `config_parametros.py` | 468 | `9658befbf528` | Configuración Maestra Institucional, Universo Tier-1, Blacklist y Contrato AST (64+ constantes) |
+| `config_parametros.py` | 528 | `99786dbc6c02` | Configuración Maestra Institucional, Universo Tier-1, Blacklist y Contrato AST (64+ constantes) |
 | `main.py` | 375 | `fdcf6baea74f` | Orquestador Central Asíncrono, Cerrojo Físico (.splitbrain.lock), Pre-Calentamiento y Reconciliación |
 | `1_radar_volatilidad.py` | 683 | `e81c534edf40` | Radar Microestructural O(1): VentanaZ, Lyapunov 1ra/2da Derivada, Kernel Hawkes 5s, VPIN y Anclaje EMA900 |
 | `2_escudo_semantico.py` | 375 | `4d3267fc6d40` | Escudo Semántico O(1) en RAM, Dinámica Evolutiva del Replicador OOS y Pool Multi-Modelo Groq LPU |
@@ -46,7 +46,7 @@
 | `6_stats_tracker.py` | 334 | `a0d47cbc5bab` | Caja Negra JSONL, Desduplicador Fantasma, Contabilidad MAP/LVR y Calculador Kelly Busseti-Ryu-Boyd |
 | `test_v6_2_suite.py` | 529 | `28fa8a1c2fb5` | Suite Determinista de 15 Pruebas de Integridad Sintáctica, Microestructural y de Reconciliación |
 
-### Módulo `config_parametros.py` (SHA-256: `9658befbf528` | 468 líneas)
+### Módulo `config_parametros.py` (SHA-256: `99786dbc6c02` | 528 líneas)
 - **Responsabilidad**: Configuración Maestra Institucional, Universo Tier-1, Blacklist y Contrato AST (64+ constantes)
 
 ### Módulo `main.py` (SHA-256: `fdcf6baea74f` | 375 líneas)
@@ -114,7 +114,7 @@
 
 ---
 
-## 4. CONTRATO SINTÁCTICO AST VERIFICADO EN `config_parametros.py` (242 CONSTANTES ACTIVAS)
+## 4. CONTRATO SINTÁCTICO AST VERIFICADO EN `config_parametros.py` (243 CONSTANTES ACTIVAS)
 
 | # | Constante AST | Valor Actual en Producción (`v6.4.2`) |
 | :---: | :--- | :--- |
@@ -145,7 +145,7 @@
 | 25 | `BYBIT_BE_PISO_MIN_PCT` | `0.0012` |
 | 26 | `BYBIT_BE_PISO_PCT` | `BYBIT_BE_PISO_MIN_PCT` |
 | 27 | `BYBIT_CODIGOS_BLACKLIST` | `CODIGOS_BLACKLIST` |
-| 28 | `BYBIT_SL_PCT` | `0.0165` |
+| 28 | `BYBIT_SL_PCT` | `0.0122` |
 | 29 | `CAIDA_MINIMA_RELATIVA` | `RETORNO_MINIMO_CAIDA_PCT` |
 | 30 | `CAIDA_MIN_PCT` | `-0.0045` |
 | 31 | `CAIDA_MIN_VENTANA_PCT` | `RETORNO_MINIMO_CAIDA_PCT` |
@@ -266,7 +266,7 @@
 | 146 | `PAPER_TRADING` | `os.getenv('PAPER_TRADING', 'False').strip().lower() in ('true'...` |
 | 147 | `PARES_CRYPTO` | `PARES_OBJETIVO` |
 | 148 | `PARES_DRENADORES_VETADOS` | `('WLD/USDT:USDT', 'ZRO/USDT:USDT', 'DOGE/USDT:USDT', 'ONDO/USD...` |
-| 149 | `PARES_NUCLEO_ALFA` | `('ZEREBRO/USDT:USDT', 'WAL/USDT:USDT', 'STRK/USDT:USDT', 'INJ/...` |
+| 149 | `PARES_NUCLEO_ALFA` | `('WAL/USDT:USDT', 'ZEREBRO/USDT:USDT', 'INJ/USDT:USDT', 'XRP/U...` |
 | 150 | `PARES_OBJETIVO` | `['NEAR/USDT:USDT', 'XRP/USDT:USDT', 'SOL/USDT:USDT', 'HYPE/USD...` |
 | 151 | `PENNY_JUMP_ACTIVO` | `True` |
 | 152 | `PENNY_JUMP_OFI_MIN` | `PENNY_JUMP_OFI_UMBRAL` |
@@ -285,11 +285,11 @@
 | 165 | `REQUOTE_TRIGGER_SEG` | `2.0` |
 | 166 | `RETORNO_MINIMO_CAIDA_PCT` | `-0.0055` |
 | 167 | `SIGMA_PISO_MINIMO` | `PISO_SIGMA_RELATIVO` |
-| 168 | `SL_BYBIT_PCT` | `0.0165` |
-| 169 | `SL_GRACIA_MECHAZO_SEG` | `18.0` |
-| 170 | `SL_INICIAL_PCT` | `0.0115` |
-| 171 | `SL_INTERNO_PCT` | `0.0115` |
-| 172 | `SL_PCT` | `0.0115` |
+| 168 | `SL_BYBIT_PCT` | `0.0122` |
+| 169 | `SL_GRACIA_MECHAZO_SEG` | `6.0` |
+| 170 | `SL_INICIAL_PCT` | `0.0088` |
+| 171 | `SL_INTERNO_PCT` | `0.0088` |
+| 172 | `SL_PCT` | `0.0122` |
 | 173 | `SL_PORCENTAJE` | `0.0115` |
 | 174 | `SPREAD_MAX_ENTRADA_PCT` | `SPREAD_MAX_PCT` |
 | 175 | `SPREAD_MAX_PCT` | `0.0012` |
@@ -305,8 +305,8 @@
 | 185 | `STATS_FILE` | `'splitbrain_stats_v6.jsonl'` |
 | 186 | `STD_MIN` | `1e-08` |
 | 187 | `STD_REL_FLOOR` | `0.0005` |
-| 188 | `STOP_LOSS_BYBIT_PCT` | `0.0165` |
-| 189 | `STOP_LOSS_PCT` | `0.0115` |
+| 188 | `STOP_LOSS_BYBIT_PCT` | `0.0122` |
+| 189 | `STOP_LOSS_PCT` | `0.0088` |
 | 190 | `SYNC_SL_EXCHANGE_SEG` | `5` |
 | 191 | `TAKER_FEE` | `FEE_TAKER` |
 | 192 | `TAKE_PROFIT_PCT` | `0.012` |
@@ -338,28 +338,29 @@
 | 218 | `UMBRAL_Z` | `-2.9` |
 | 219 | `UMBRAL_Z_SCORE` | `-2.9` |
 | 220 | `UNIVERSO_PARES` | `PARES_OBJETIVO` |
-| 221 | `VENTANA_MAX_EDAD_SEG` | `VENTANA_TIEMPO_MAX_SEG` |
-| 222 | `VENTANA_MIN_TICKS` | `MIN_TICKS_VENTANA` |
-| 223 | `VENTANA_TICKS` | `50` |
-| 224 | `VENTANA_TIEMPO_MAX_SEG` | `25.0` |
-| 225 | `VENTANA_Z_TICKS` | `VENTANA_TICKS` |
-| 226 | `VOLUMEN_MIN_24H_USDT` | `15000000.0` |
-| 227 | `VOL_MAX_P99_ALFA_REL` | `0.0085` |
-| 228 | `VOL_MAX_P99_REL` | `0.0065` |
-| 229 | `VPIN_MAX` | `VPIN_UMBRAL_MAXIMO` |
-| 230 | `VPIN_MAX_ENTRADA` | `VPIN_UMBRAL_MAXIMO` |
-| 231 | `VPIN_MAX_TOXICO` | `0.72` |
-| 232 | `VPIN_UMBRAL_MAXIMO` | `0.65` |
-| 233 | `WS_KEEPALIVE_MS` | `10000` |
-| 234 | `WS_MAX_PING_MISSES` | `5.0` |
-| 235 | `WS_POSITIONS_STREAM_ACTIVO` | `True` |
-| 236 | `ZONAS_EXCLUIDAS` | `{'innovation', 'pre-market', 'premarket'}` |
-| 237 | `Z_MAX_ABS` | `50.0` |
-| 238 | `Z_MIN_ENTRADA` | `Z_SCORE_UMBRAL` |
-| 239 | `Z_SCORE_NUCLEO_ALFA` | `-2.85` |
-| 240 | `Z_SCORE_SECUNDARIOS_OOS` | `-3.15` |
-| 241 | `Z_SCORE_UMBRAL` | `-2.9` |
-| 242 | `Z_UMBRAL` | `-2.9` |
+| 221 | `UNIVERSO_SHAPLEY_ELITE` | `['WAL/USDT:USDT', 'ZEREBRO/USDT:USDT', 'INJ/USDT:USDT', 'XRP/U...` |
+| 222 | `VENTANA_MAX_EDAD_SEG` | `VENTANA_TIEMPO_MAX_SEG` |
+| 223 | `VENTANA_MIN_TICKS` | `MIN_TICKS_VENTANA` |
+| 224 | `VENTANA_TICKS` | `50` |
+| 225 | `VENTANA_TIEMPO_MAX_SEG` | `25.0` |
+| 226 | `VENTANA_Z_TICKS` | `VENTANA_TICKS` |
+| 227 | `VOLUMEN_MIN_24H_USDT` | `15000000.0` |
+| 228 | `VOL_MAX_P99_ALFA_REL` | `0.0085` |
+| 229 | `VOL_MAX_P99_REL` | `0.0065` |
+| 230 | `VPIN_MAX` | `VPIN_UMBRAL_MAXIMO` |
+| 231 | `VPIN_MAX_ENTRADA` | `VPIN_UMBRAL_MAXIMO` |
+| 232 | `VPIN_MAX_TOXICO` | `0.72` |
+| 233 | `VPIN_UMBRAL_MAXIMO` | `0.65` |
+| 234 | `WS_KEEPALIVE_MS` | `10000` |
+| 235 | `WS_MAX_PING_MISSES` | `5.0` |
+| 236 | `WS_POSITIONS_STREAM_ACTIVO` | `True` |
+| 237 | `ZONAS_EXCLUIDAS` | `{'innovation', 'pre-market', 'premarket'}` |
+| 238 | `Z_MAX_ABS` | `50.0` |
+| 239 | `Z_MIN_ENTRADA` | `Z_SCORE_UMBRAL` |
+| 240 | `Z_SCORE_NUCLEO_ALFA` | `-2.85` |
+| 241 | `Z_SCORE_SECUNDARIOS_OOS` | `-3.2` |
+| 242 | `Z_SCORE_UMBRAL` | `-2.9` |
+| 243 | `Z_UMBRAL` | `-2.9` |
 
 ---
 
